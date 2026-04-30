@@ -2,6 +2,8 @@
 
 This repository packages the Kimi K2.6 warp-decode implementation work, the SGLang/FlashInfer patch sets, and the latest verified 8x B200 benchmark artifacts.
 
+This work is based on the Warp Decode idea described in Cursor's technical blog post: [Warp Decode: Faster MoE inference at batch size one](https://cursor.com/blog/warp-decode). Credit for the core row-major warp-decode concept goes to the Cursor team; this repository is an independent Kimi K2.6/SGLang/FlashInfer implementation and benchmark package.
+
 The implementation has three benchmark variants:
 
 - `sota`: regular prefill kernel and regular FlashInfer/TRTLLM decode MoE kernel.
@@ -73,5 +75,13 @@ cp -R /path/to/warp-decode-kimi-k26/overlays/flashinfer-trtllmgen-moe/. .
 ## Current Technical Read
 
 The implementation is not currently a validated reproduction of Cursor's reported speedups. In the latest verified 8x B200 run, the active row-major and tiled warp decode implementations underperformed the FlashInfer/TRTLLM baseline.
+
+It is currently unclear why this implementation is so much slower than the behavior reported in Cursor's Warp Decode blog. Plausible explanations include:
+
+- The Kimi K2.6 INT4/TP=8 shape may interact very differently with warp-level decomposition than the model, quantization format, and sharding setup Cursor benchmarked.
+- The FlashInfer/TRTLLM baseline used here may already avoid enough practical routing overhead, or may use stronger fused/persistent MoE scheduling, making it a harder baseline than the one assumed by this implementation.
+- The current row-major warp kernels may be functionally close to the blog design but not performance-equivalent at the CUDA instruction/memory-transaction level.
+- The implementation still materializes intermediate gate/up outputs and top-k state, so any residual memory traffic or launch/capture overhead may erase the intended decode benefit.
+- The local TP shard size, shared-expert behavior, MXINT4 scale layout, and W2 access pattern may be leaving the active warp path memory-inefficient despite having no ptxas spills.
 
 The next debugging target should be an isolated MoE-layer benchmark comparing FlashInfer/TRTLLM MxINT4 MoE versus the row-major warp decode path, with kernel timing split across top-k, gate/up, and down projection.
