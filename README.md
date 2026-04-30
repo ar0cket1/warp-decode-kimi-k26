@@ -27,6 +27,30 @@ Setup: 8x B200, `moonshotai/Kimi-K2.6`, INT4, TP=8, EP=1, random dataset, ISL=10
 
 Full result artifacts are in `results/b200_context_fixed/`.
 
+## Custom Tiled `W_down` Variant
+
+The `warp-decode-tiled-down` path is a custom extension on top of the Cursor-style row-major warp decode implementation. The intent is to address one of the main remaining decode bottlenecks for routed MoE: after the router selects `TOP_K=8` experts, the down projection has to read weight rows for several different experts. In a normal expert-major layout, those reads can jump across large expert matrices, which is bad for cache locality and memory transaction efficiency during batch-size-one or low-concurrency decode.
+
+The custom path keeps `W_gate` and `W_up` in their existing expert-major format, but gives only the MoE down-projection weights a decode-specific layout:
+
+```text
+W_down_decode[output_hidden_tile][intermediate_tile][expert][packed_tile_payload]
+```
+
+The intuition is that a warp computing a fixed output-hidden tile walks through the intermediate dimension and needs the same routed experts for every intermediate tile. By placing the selected experts' down-projection tiles close together for each `(output_hidden_tile, intermediate_tile)` pair, the kernel can read the 8 routed expert tiles from a compact neighborhood instead of bouncing across full expert-major matrices.
+
+Implementation details in this repository:
+
+- Only `W_down` gets the tiled decode layout; `W_gate` and `W_up` stay in the normal format.
+- Each expert tile's packed INT4 payload remains internally contiguous; the layout is expert-interleaved at tile granularity, not scalar-interleaved across experts.
+- Tile addressing is designed around a fixed base for each `(output_hidden_tile, intermediate_tile)`, so expert addresses are computed as `tile_group_base + expert_id * expert_tile_stride`.
+- The decode kernel is specialized for Kimi K2.6's fixed routed `TOP_K=8` and unrolls the routed expert accumulation.
+- The implementation uses the same MXINT4 group-size assumption as the Kimi K2.6 serving path used during this work, with `group_size=32`.
+- The path avoids runtime token grouping, padding-based dispatch, scatter/combine buffers, and hot-path repacking during decode; the extra layout work is intended to happen before serving/decode execution.
+- The B200 ptxas validation included in `results/b200_context_fixed/ptxas_checks/` showed no local-memory spills for the tiled down kernel.
+
+This was expected to improve on plain row-major warp decode by reducing the memory-latency penalty from non-contiguous routed expert accesses in `W_down`. In the latest verified B200 end-to-end result, however, the tiled path did not improve throughput over the row-major warp-decode path, so the current implementation should be treated as an experimental layout idea rather than a validated speedup.
+
 ## Contents
 
 - `patches/sglang-kimi-k26-warp-decode.patch`: SGLang integration patch.
