@@ -1,6 +1,6 @@
 # Warp Decode for Kimi K2.6
 
-This repository packages the Kimi K2.6 warp-decode implementation work, the SGLang/FlashInfer patch sets, and the reported 8x B200 benchmark artifacts.
+This repository packages the Kimi K2.6 warp-decode implementation work, the SGLang/FlashInfer patch sets, and the latest verified 8x B200 benchmark artifacts.
 
 The implementation has three benchmark variants:
 
@@ -8,15 +8,29 @@ The implementation has three benchmark variants:
 - `warp-decode`: regular prefill kernel and Cursor-style row-major warp decode MoE kernel.
 - `warp-decode-tiled-down`: regular prefill kernel and custom tiled `W_down` warp decode MoE kernel.
 
-Important status: the B200 run with active CUDA/Python markers showed that the row-major and tiled warp decode kernels were actually active during decode, but they were slower than the FlashInfer/TRTLLM baseline for this TP=8 Kimi K2.6 setup. The current patches include a later internal-topk integration follow-up that still needs fresh GPU validation.
+Important status: the latest verified B200 run showed that the row-major and tiled warp decode kernels were active during decode, but they were slower than the FlashInfer/TRTLLM baseline for this TP=8 Kimi K2.6 setup. The current patches include a later internal-topk integration follow-up that still needs fresh GPU validation.
+
+## Latest Verified Results
+
+Setup: 8x B200, `moonshotai/Kimi-K2.6`, INT4, TP=8, EP=1, random dataset, ISL=1024, OSL=1024, concurrency 1 and 4.
+
+| Variant | Prefill MoE backend | Decode MoE backend | Concurrency | Output tok/s total | Output tok/s/GPU | Runtime verified | CUDA active markers | Fallback markers |
+| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |
+| `sota` | `flashinfer_trtllm` | `flashinfer_trtllm` | 1 | 146.82 | 18.35 | false | 0 | 0 |
+| `sota` | `flashinfer_trtllm` | `flashinfer_trtllm` | 4 | 500.61 | 62.58 | false | 0 | 0 |
+| `warp-decode` | `flashinfer_trtllm` | `flashinfer_kimi_warp_decode` | 1 | 80.66 | 10.08 | true | 8 | 16 |
+| `warp-decode` | `flashinfer_trtllm` | `flashinfer_kimi_warp_decode` | 4 | 218.99 | 27.37 | true | 8 | 16 |
+| `warp-decode-tiled-down` | `flashinfer_trtllm` | `flashinfer_kimi_warp_decode_tiled_down` | 1 | 79.73 | 9.97 | true | 8 | 16 |
+| `warp-decode-tiled-down` | `flashinfer_trtllm` | `flashinfer_kimi_warp_decode_tiled_down` | 4 | 216.81 | 27.10 | true | 8 | 16 |
+
+Full result artifacts are in `results/b200_context_fixed/`.
 
 ## Contents
 
 - `patches/sglang-kimi-k26-warp-decode.patch`: SGLang integration patch.
 - `patches/flashinfer-trtllmgen-moe-kimi-k26-warp-decode.patch`: FlashInfer/TRTLLM-gen MoE kernel patch.
 - `overlays/`: untracked/new files from the working trees that are not included in normal `git diff` output.
-- `results/b200_initial/`: initial 8x B200 result set where warp variants appeared nearly identical to SOTA.
-- `results/b200_context_fixed/`: context-fixed 8x B200 result set with runtime marker validation.
+- `results/b200_context_fixed/`: latest verified 8x B200 result set with runtime marker validation.
 - `docs/results.md`: concise result table and interpretation.
 
 ## Base Revisions
@@ -58,6 +72,6 @@ cp -R /path/to/warp-decode-kimi-k26/overlays/flashinfer-trtllmgen-moe/. .
 
 ## Current Technical Read
 
-The implementation is not currently a validated reproduction of Cursor's reported speedups. The active-kernel B200 run is useful because it rules out the earlier "same kernel accidentally used for every variant" explanation for the context-fixed result.
+The implementation is not currently a validated reproduction of Cursor's reported speedups. In the latest verified 8x B200 run, the active row-major and tiled warp decode implementations underperformed the FlashInfer/TRTLLM baseline.
 
 The next debugging target should be an isolated MoE-layer benchmark comparing FlashInfer/TRTLLM MxINT4 MoE versus the row-major warp decode path, with kernel timing split across top-k, gate/up, and down projection.
