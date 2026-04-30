@@ -1,0 +1,901 @@
+diff --git a/python/sglang/srt/compilation/piecewise_context_manager.py b/python/sglang/srt/compilation/piecewise_context_manager.py
+index 20a08a9..8b3f3fb 100644
+--- a/python/sglang/srt/compilation/piecewise_context_manager.py
++++ b/python/sglang/srt/compilation/piecewise_context_manager.py
+@@ -89,6 +89,7 @@ class ForwardContext:
+ 
+ 
+ _forward_context: Optional[ForwardContext] = None
++_current_forward_batch: Optional["ForwardBatch"] = None
+ 
+ 
+ def get_forward_context() -> Optional[ForwardContext]:
+@@ -97,6 +98,23 @@ def get_forward_context() -> Optional[ForwardContext]:
+     return _forward_context
+ 
+ 
++def get_current_forward_batch() -> Optional["ForwardBatch"]:
++    if _forward_context is not None:
++        return _forward_context.forward_batch
++    return _current_forward_batch
++
++
++@contextmanager
++def set_current_forward_batch(forward_batch: ForwardBatch):
++    global _current_forward_batch
++    previous_forward_batch = _current_forward_batch
++    _current_forward_batch = forward_batch
++    try:
++        yield
++    finally:
++        _current_forward_batch = previous_forward_batch
++
++
+ @contextmanager
+ def set_forward_context(
+     forward_batch: ForwardBatch,
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index f34ffc1..71bdaf0 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -221,8 +221,7 @@ class FusedMoE(torch.nn.Module):
+ 
+         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+         self.use_flashinfer_trtllm_moe = (
+-            get_moe_runner_backend().is_flashinfer_trtllm()
+-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
++            get_moe_runner_backend().is_flashinfer_trtllm_family()
+         )
+ 
+         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
+@@ -314,6 +313,10 @@ class FusedMoE(torch.nn.Module):
+                 isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+                 and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+             )
++            or (
++                isinstance(self.quant_method, CompressedTensorsMxInt4MoE)
++                and get_moe_runner_backend().is_flashinfer_trtllm_family()
++            )
+         )
+ 
+         self.routing_method_type = routing_method_type
+@@ -1281,17 +1284,22 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
+     renormalize: bool,
+     layer_id: int,
+ ) -> torch.Tensor:
++    forward_context = get_forward_context()
++    moe_layer = forward_context.moe_layers[layer_id]
+     topk_output = BypassedTopKOutput(
+         hidden_states=hidden_states,
+         router_logits=router_logits,
+         topk_config=TopKConfig(
+             top_k=top_k,
++            use_grouped_topk=num_expert_group is not None,
+             topk_group=topk_group,
+             num_expert_group=num_expert_group,
+             correction_bias=correction_bias,
+             renormalize=renormalize,
++            routed_scaling_factor=moe_layer.moe_runner_config.routed_scaling_factor,
++            apply_routed_scaling_factor_on_output=(
++                moe_layer.should_fuse_routed_scaling_factor_in_topk
++            ),
+         ),
+     )
+-    forward_context = get_forward_context()
+-    moe_layer = forward_context.moe_layers[layer_id]
+     return moe_layer.forward_impl(hidden_states, topk_output)
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 02fac83..ef550eb 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -322,6 +322,7 @@ class TopK(MultiPlatformOp):
+             output_format = TopKOutputFormat.TRITON_KERNEL
+         elif (
+             get_moe_runner_backend().is_flashinfer_trtllm()
++            or get_moe_runner_backend().is_flashinfer_kimi_warp_decode_family()
+             or get_moe_runner_backend().is_flashinfer_mxfp4()
+         ):
+             output_format = TopKOutputFormat.BYPASSED
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index 73dde31..551ab28 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -73,6 +73,8 @@ class MoeRunnerBackend(Enum):
+     TRITON_KERNELS = "triton_kernel"
+     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
++    FLASHINFER_KIMI_WARP_DECODE = "flashinfer_kimi_warp_decode"
++    FLASHINFER_KIMI_WARP_DECODE_TILED_DOWN = "flashinfer_kimi_warp_decode_tiled_down"
+     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
+     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+@@ -97,6 +99,25 @@ class MoeRunnerBackend(Enum):
+     def is_flashinfer_trtllm_routed(self):
+         return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+ 
++    def is_flashinfer_kimi_warp_decode(self):
++        return self == MoeRunnerBackend.FLASHINFER_KIMI_WARP_DECODE
++
++    def is_flashinfer_kimi_warp_decode_tiled_down(self):
++        return self == MoeRunnerBackend.FLASHINFER_KIMI_WARP_DECODE_TILED_DOWN
++
++    def is_flashinfer_kimi_warp_decode_family(self):
++        return (
++            self == MoeRunnerBackend.FLASHINFER_KIMI_WARP_DECODE
++            or self == MoeRunnerBackend.FLASHINFER_KIMI_WARP_DECODE_TILED_DOWN
++        )
++
++    def is_flashinfer_trtllm_family(self):
++        return (
++            self == MoeRunnerBackend.FLASHINFER_TRTLLM
++            or self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
++            or self.is_flashinfer_kimi_warp_decode_family()
++        )
++
+     def is_flashinfer_cutlass(self):
+         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
+ 
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+index f276fca..5f39e14 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -180,7 +180,7 @@ class CompressedTensorsConfig(QuantizationConfig):
+             if layer.scheme is None:  # ignored layer
+                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+                 use_flashinfer_trtllm_moe = (
+-                    get_moe_runner_backend().is_flashinfer_trtllm()
++                    get_moe_runner_backend().is_flashinfer_trtllm_family()
+                 )
+                 return UnquantizedFusedMoEMethod(
+                     use_triton_kernels, use_flashinfer_trtllm_moe
+@@ -672,10 +672,10 @@ class CompressedTensorsConfig(QuantizationConfig):
+             if not _is_npu:
+                 if (
+                     self._is_mxint4a16(weight_quant, input_quant)
+-                    and get_moe_runner_backend().is_flashinfer_trtllm()
++                    and get_moe_runner_backend().is_flashinfer_trtllm_family()
+                 ):
+                     logger.info_once(
+-                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
++                        "Using CompressedTensorsMxInt4MoE with FlashInfer TRTLLM-family backend"
+                     )
+                     return CompressedTensorsMxInt4MoE(self)
+                 elif _is_hip:
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
+index 569e204..2e42fb1 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -21,6 +22,24 @@ from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weigh
+ 
+ logger = logging.getLogger(__name__)
+ 
++_KIMI_WARP_DECODE_LOGGED = False
++_KIMI_WARP_DECODE_FALLBACK_LOGGED = False
++KIMI_WARP_DECODE_DOWN_OUTPUT_HIDDEN_TILE = 1
++KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE = 256
++KIMI_WARP_DECODE_DOWN_EXPERT_TILE_STRIDE_BYTES = 128
++KIMI_K26_MOE_INTERMEDIATE_SIZE_PER_TP_PARTITION = 256
++
++
++def _env_truthy(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def _emit_kimi_warp_decode_marker(message: str) -> None:
++    """Emit a marker that survives worker logging configuration differences."""
++
++    if _env_truthy("SGLANG_KIMI_WARP_DECODE_MARK_ACTIVE"):
++        print(message, flush=True)
++
+ __all__ = ["CompressedTensorsMxInt4MoE"]
+ 
+ if TYPE_CHECKING:
+@@ -38,10 +57,28 @@ if is_flashinfer_available():
+         convert_to_block_layout,
+         trtllm_mxint4_block_scale_moe,
+     )
++    try:
++        from flashinfer.fused_moe import (
++            kimi_k26_mxint4_warp_decode_moe,
++            kimi_k26_mxint4_warp_decode_tiled_down_moe,
++            kimi_k26_mxint4_warp_decode_moe_with_topk,
++            kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk,
++        )
++    except ImportError:
++        kimi_k26_mxint4_warp_decode_moe = None
++        kimi_k26_mxint4_warp_decode_tiled_down_moe = None
++        kimi_k26_mxint4_warp_decode_moe_with_topk = None
++        kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk = None
++
+     from flashinfer.fused_moe.core import (
+         _maybe_get_cached_w3_w1_permute_indices,
+         get_w2_permute_indices_with_cache,
+     )
++else:
++    kimi_k26_mxint4_warp_decode_moe = None
++    kimi_k26_mxint4_warp_decode_tiled_down_moe = None
++    kimi_k26_mxint4_warp_decode_moe_with_topk = None
++    kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk = None
+ 
+ 
+ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+@@ -59,9 +96,14 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+             and config.num_bits == 4
+         ), "MxInt4 only supports group strategy with group size 32"
+         assert config.symmetric, "Only symmetric quantization is supported for MoE"
++        moe_backend = get_moe_runner_backend()
++        self.use_kimi_warp_decode = moe_backend.is_flashinfer_kimi_warp_decode_family()
++        self.use_kimi_warp_decode_tiled_down = (
++            moe_backend.is_flashinfer_kimi_warp_decode_tiled_down()
++        )
+         assert (
+-            get_moe_runner_backend().is_flashinfer_trtllm()
+-        ), "MxInt4 only supports flashinfer_trtllm backend"
++            moe_backend.is_flashinfer_trtllm() or self.use_kimi_warp_decode
++        ), "MxInt4 supports flashinfer_trtllm or Kimi FlashInfer warp-decode backends"
+         assert (
+             not config.actorder
+         ), "Actorder is not supported by flashinfer_trtllm backend"
+@@ -76,6 +118,8 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
++        if _env_truthy("SGLANG_KIMI_WARP_DECODE_ALLOW_HOPPER"):
++            return 90
+         # Requires sm100(blackwell) architecture
+         return 100
+ 
+@@ -262,9 +306,186 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+             gemm2_scales_shuffled,
+         )
+ 
++    @staticmethod
++    def _repack_compressed_tensors_int32_to_signed_uint8(w: torch.Tensor) -> torch.Tensor:
++        assert w.dim() == 2 and w.dtype == torch.int32
++        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
++        w = (w.unsqueeze(2) >> shifts) & 0x0F
++        w = (w - 8).to(torch.int8).reshape(w.shape[0], -1, 2)
++        w = (w[..., 0] & 0x0F) | ((w[..., 1] & 0x0F) << 4)
++        return w.to(torch.uint8)
++
++    def prepare_static_weights_for_warp_decode(
++        self,
++        gemm1_weights: torch.Tensor,
++        gemm2_weights: torch.Tensor,
++        gemm1_scales: torch.Tensor,
++        gemm2_scales: torch.Tensor,
++        num_experts: int,
++    ):
++        """Prepare row-major signed MxInt4 weights for the warp-decode path.
++
++        The regular FlashInfer TRTLLM path consumes shuffled BlockMajorK weights.
++        Warp decode streams one row per warp, so it keeps row-major packed int4.
++        SGLang loads flashinfer-trtllm w13 in [up, gate] order; the new kernel
++        uses logical [gate, up], so this preparation swaps the two halves.
++        """
++
++        gemm1_u8 = []
++        gemm2_u8 = []
++        for i in range(num_experts):
++            gemm1_u8.append(
++                self._repack_compressed_tensors_int32_to_signed_uint8(gemm1_weights[i])
++            )
++            gemm2_u8.append(
++                self._repack_compressed_tensors_int32_to_signed_uint8(gemm2_weights[i])
++            )
++
++        gemm1_u8 = torch.stack(gemm1_u8).contiguous()
++        gemm2_u8 = torch.stack(gemm2_u8).contiguous()
++
++        intermediate = gemm1_u8.shape[1] // 2
++        gemm1_u8 = torch.cat(
++            [gemm1_u8[:, intermediate:], gemm1_u8[:, :intermediate]], dim=1
++        ).contiguous()
++        gemm1_scales = torch.cat(
++            [gemm1_scales[:, intermediate:], gemm1_scales[:, :intermediate]], dim=1
++        )
++
++        return (
++            gemm1_u8,
++            gemm1_scales.to(torch.bfloat16).contiguous(),
++            gemm2_u8,
++            gemm2_scales.to(torch.bfloat16).contiguous(),
++        )
++
++    def prepare_tiled_down_weights_for_warp_decode(
++        self,
++        gemm2_u8: torch.Tensor,
++        gemm2_scales: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Tile W_down for the custom decode path at weight-load time.
++
++        Kimi K2.6 compressed-tensors MxInt4 serving asserts group size 32.
++        The InferenceX-style TP=8 serving shape stores only 256 intermediate
++        values per TP rank, so this is one full dequant-aligned K tile.
++        We therefore use an intermediate tile of 256 elements: it is a clean
++        multiple of the dequant group and packs to exactly 128 contiguous INT4
++        bytes per expert tile. The resulting layout is:
++        [output_hidden_tile, intermediate_tile, expert, packed_tile_payload].
++        """
++
++        assert self.group_size == 32, "Kimi MxInt4 decode tiling assumes group size 32"
++        assert gemm2_u8.dim() == 3 and gemm2_u8.dtype == torch.uint8
++        assert gemm2_scales.dim() == 3 and gemm2_scales.dtype == torch.bfloat16
++
++        num_experts, hidden_size, packed_intermediate = gemm2_u8.shape
++        intermediate = packed_intermediate * 2
++        assert (
++            intermediate % KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE == 0
++        ), "intermediate tile must divide the Kimi K2.6 intermediate size"
++        assert (
++            KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE % self.group_size == 0
++        ), "intermediate tile must be a multiple of the dequant group size"
++        assert (
++            KIMI_WARP_DECODE_DOWN_OUTPUT_HIDDEN_TILE == 1
++        ), "the current kernel keeps one warp per output hidden scalar"
++
++        num_intermediate_tiles = (
++            intermediate // KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE
++        )
++        tile_payload_bytes = KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE // 2
++        scale_groups_per_tile = (
++            KIMI_WARP_DECODE_DOWN_INTERMEDIATE_TILE // self.group_size
++        )
++        assert tile_payload_bytes == KIMI_WARP_DECODE_DOWN_EXPERT_TILE_STRIDE_BYTES
++        assert gemm2_scales.shape == (
++            num_experts,
++            hidden_size,
++            intermediate // self.group_size,
++        )
++
++        gemm2_tiled = (
++            gemm2_u8.view(
++                num_experts,
++                hidden_size,
++                num_intermediate_tiles,
++                tile_payload_bytes,
++            )
++            .permute(1, 2, 0, 3)
++            .contiguous()
++        )
++        gemm2_scales_tiled = (
++            gemm2_scales.view(
++                num_experts,
++                hidden_size,
++                num_intermediate_tiles,
++                scale_groups_per_tile,
++            )
++            .permute(1, 2, 0, 3)
++            .contiguous()
++        )
++        return gemm2_tiled, gemm2_scales_tiled
++
++    @staticmethod
++    def _register_or_replace_parameter(
++        layer: torch.nn.Module, name: str, tensor: torch.Tensor
++    ) -> None:
++        if hasattr(layer, name):
++            replace_parameter(layer, name, tensor)
++        else:
++            layer.register_parameter(
++                name, torch.nn.Parameter(tensor.contiguous(), requires_grad=False)
++            )
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+ 
+         num_experts = layer.w13_weight_packed.shape[0]
++        if self.use_kimi_warp_decode:
++            (
++                gemm1_weights_warp_decode,
++                gemm1_scales_warp_decode,
++                gemm2_weights_warp_decode,
++                gemm2_scales_warp_decode,
++            ) = self.prepare_static_weights_for_warp_decode(
++                layer.w13_weight_packed,
++                layer.w2_weight_packed,
++                layer.w13_weight_scale,
++                layer.w2_weight_scale,
++                num_experts=num_experts,
++            )
++            self._register_or_replace_parameter(
++                layer, "w13_weight_warp_decode", gemm1_weights_warp_decode
++            )
++            self._register_or_replace_parameter(
++                layer, "w13_weight_scale_warp_decode", gemm1_scales_warp_decode
++            )
++            if self.use_kimi_warp_decode_tiled_down:
++                (
++                    gemm2_weights_tiled_down,
++                    gemm2_scales_tiled_down,
++                ) = self.prepare_tiled_down_weights_for_warp_decode(
++                    gemm2_weights_warp_decode,
++                    gemm2_scales_warp_decode,
++                )
++                self._register_or_replace_parameter(
++                    layer,
++                    "w2_weight_tiled_down_warp_decode",
++                    gemm2_weights_tiled_down,
++                )
++                self._register_or_replace_parameter(
++                    layer,
++                    "w2_weight_scale_tiled_down_warp_decode",
++                    gemm2_scales_tiled_down,
++                )
++            else:
++                self._register_or_replace_parameter(
++                    layer, "w2_weight_warp_decode", gemm2_weights_warp_decode
++                )
++                self._register_or_replace_parameter(
++                    layer, "w2_weight_scale_warp_decode", gemm2_scales_warp_decode
++                )
++
+         (
+             gemm1_weights_mxint4_shuffled,
+             gemm1_scales_shuffled,
+@@ -293,6 +514,10 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+         dispatch_output: StandardDispatchOutput,
+     ) -> CombineInput:
+         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
++        from sglang.srt.layers.moe.topk import TopKOutputChecker
++        from sglang.srt.compilation.piecewise_context_manager import (
++            get_current_forward_batch,
++        )
+ 
+         assert (
+             self.moe_runner_config.is_gated
+@@ -300,6 +525,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+ 
+         x = dispatch_output.hidden_states
+         topk_output = dispatch_output.topk_output
++        assert TopKOutputChecker.format_is_bypassed(
++            topk_output
++        ), "FlashInfer MxInt4 MoE expects bypassed router logits."
+ 
+         router_logits = topk_output.router_logits
+         topk_config = topk_output.topk_config
+@@ -330,28 +558,212 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
+                 num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device
+             )
+ 
+-        trtllm_mxint4_block_scale_moe(
+-            routing_logits=router_logits,  # float
+-            routing_bias=correction_bias,
+-            hidden_states=x,
+-            gemm1_weights=layer.w13_weight_packed,
+-            gemm1_weights_scale=layer.w13_weight_scale,
+-            gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+-            gemm1_beta=None,
+-            gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
+-            gemm2_weights=layer.w2_weight_packed,
+-            gemm2_weights_scale=layer.w2_weight_scale,
+-            num_experts=self.moe_runner_config.num_experts,
+-            top_k=topk_config.top_k,
+-            n_group=topk_config.num_expert_group,
+-            topk_group=topk_config.topk_group,
+-            intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
+-            local_expert_offset=self.moe_ep_rank * local_num_experts,
+-            local_num_experts=local_num_experts,
+-            routed_scaling_factor=routed_scaling_factor,
+-            routing_method_type=routing_method_type,
+-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+-            output=symm_output,
++        forward_batch = get_current_forward_batch()
++        is_decode = (
++            forward_batch is not None and forward_batch.forward_mode.is_decode_or_idle()
+         )
++        local_expert_offset = self.moe_ep_rank * local_num_experts
++        warp_decode_failures = []
++        can_use_warp_decode = False
++
++        def require_warp_decode(condition: bool, reason: str) -> None:
++            if not condition:
++                warp_decode_failures.append(reason)
++
++        if self.use_kimi_warp_decode:
++            require_warp_decode(
++                (
++                    kimi_k26_mxint4_warp_decode_tiled_down_moe
++                    if self.use_kimi_warp_decode_tiled_down
++                    else kimi_k26_mxint4_warp_decode_moe
++                )
++                is not None,
++                "FlashInfer Kimi warp-decode op is unavailable",
++            )
++            require_warp_decode(is_decode, "forward mode is not decode")
++            require_warp_decode(
++                x.shape[0] <= 64, f"decode batch {x.shape[0]} exceeds 64"
++            )
++            require_warp_decode(x.dtype == torch.bfloat16, f"hidden dtype is {x.dtype}")
++            require_warp_decode(
++                topk_output.num_token_non_padded is None,
++                "padded token metadata is present",
++            )
++            require_warp_decode(
++                topk_output.expert_location_dispatch_info is None,
++                "expert-location dispatch metadata is present",
++            )
++            require_warp_decode(
++                self.moe_runner_config.num_experts == 384,
++                f"num_experts is {self.moe_runner_config.num_experts}",
++            )
++            require_warp_decode(topk_config.top_k == 8, f"top_k is {topk_config.top_k}")
++            require_warp_decode(
++                topk_config.num_fused_shared_experts == 0,
++                "fused shared experts are present",
++            )
++            require_warp_decode(
++                topk_config.renormalize,
++                "internal warp-decode top-k expects normalized routed weights",
++            )
++            require_warp_decode(
++                topk_config.apply_routed_scaling_factor_on_output,
++                "internal warp-decode top-k expects routed scaling folded into weights",
++            )
++            require_warp_decode(
++                topk_config.num_expert_group in (None, 1),
++                f"num_expert_group is {topk_config.num_expert_group}",
++            )
++            require_warp_decode(
++                topk_config.topk_group in (None, 1),
++                f"topk_group is {topk_config.topk_group}",
++            )
++            require_warp_decode(
++                self.moe_runner_config.intermediate_size_per_partition
++                == KIMI_K26_MOE_INTERMEDIATE_SIZE_PER_TP_PARTITION,
++                "intermediate_size_per_partition is "
++                f"{self.moe_runner_config.intermediate_size_per_partition}",
++            )
++            require_warp_decode(x.shape[-1] == 7168, f"hidden_size is {x.shape[-1]}")
++            require_warp_decode(
++                local_expert_offset == 0, f"local_expert_offset is {local_expert_offset}"
++            )
++            require_warp_decode(
++                local_num_experts == self.moe_runner_config.num_experts,
++                f"local_num_experts is {local_num_experts}",
++            )
++            require_warp_decode(
++                self.moe_runner_config.gemm1_alpha is None, "gemm1_alpha is set"
++            )
++            require_warp_decode(
++                self.moe_runner_config.gemm1_clamp_limit is None,
++                "gemm1_clamp_limit is set",
++            )
++            require_warp_decode(
++                hasattr(layer, "w13_weight_warp_decode"),
++                "warp-decode weights were not prepared",
++            )
++            if self.use_kimi_warp_decode_tiled_down:
++                require_warp_decode(
++                    hasattr(layer, "w2_weight_tiled_down_warp_decode"),
++                    "tiled W_down warp-decode weights were not prepared",
++                )
++            else:
++                require_warp_decode(
++                    hasattr(layer, "w2_weight_warp_decode"),
++                    "row-major W_down warp-decode weights were not prepared",
++                )
++            can_use_warp_decode = not warp_decode_failures
++
++        if (
++            self.use_kimi_warp_decode
++            and is_decode
++            and _env_truthy("SGLANG_REQUIRE_KIMI_WARP_DECODE")
++            and not can_use_warp_decode
++        ):
++            raise RuntimeError(
++                "FlashInfer Kimi warp-decode was required for a decode MoE call, "
++                "but the path is unavailable: " + "; ".join(warp_decode_failures)
++            )
++
++        if can_use_warp_decode:
++            global _KIMI_WARP_DECODE_LOGGED
++            if not _KIMI_WARP_DECODE_LOGGED and x.shape[0] > 0:
++                variant = (
++                    "tiled-W_down"
++                    if self.use_kimi_warp_decode_tiled_down
++                    else "row-major"
++                )
++                marker = (
++                    "SGLANG_KIMI_WARP_DECODE_ACTIVE "
++                    f"variant={variant} layer_id={getattr(layer, 'layer_id', 'unknown')} "
++                    f"batch={x.shape[0]} hidden_size={x.shape[-1]} "
++                    f"top_k={topk_config.top_k}"
++                )
++                logger.warning(marker)
++                _emit_kimi_warp_decode_marker(marker)
++                logger.warning(
++                    "FlashInfer Kimi warp-decode MoE active (%s): batch<=64, "
++                    "Kimi K2.6 MxInt4 shape guards satisfied.",
++                    variant,
++                )
++                _KIMI_WARP_DECODE_LOGGED = True
++            warp_decode_op = (
++                kimi_k26_mxint4_warp_decode_tiled_down_moe
++                if self.use_kimi_warp_decode_tiled_down
++                else kimi_k26_mxint4_warp_decode_moe
++            )
++            gemm2_weights = (
++                layer.w2_weight_tiled_down_warp_decode
++                if self.use_kimi_warp_decode_tiled_down
++                else layer.w2_weight_warp_decode
++            )
++            gemm2_weights_scale = (
++                layer.w2_weight_scale_tiled_down_warp_decode
++                if self.use_kimi_warp_decode_tiled_down
++                else layer.w2_weight_scale_warp_decode
++            )
++            warp_decode_op(
++                routing_logits=router_logits,
++                routing_bias=correction_bias,
++                hidden_states=x,
++                gemm1_weights=layer.w13_weight_warp_decode,
++                gemm1_weights_scale=layer.w13_weight_scale_warp_decode,
++                gemm1_alpha=None,
++                gemm1_beta=None,
++                gemm1_clamp_limit=None,
++                gemm2_weights=gemm2_weights,
++                gemm2_weights_scale=gemm2_weights_scale,
++                num_experts=self.moe_runner_config.num_experts,
++                top_k=topk_config.top_k,
++                n_group=topk_config.num_expert_group,
++                topk_group=topk_config.topk_group,
++                intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
++                local_expert_offset=local_expert_offset,
++                local_num_experts=local_num_experts,
++                routed_scaling_factor=routed_scaling_factor,
++                routing_method_type=routing_method_type,
++                output=symm_output,
++            )
++        else:
++            global _KIMI_WARP_DECODE_FALLBACK_LOGGED
++            if (
++                self.use_kimi_warp_decode
++                and not _KIMI_WARP_DECODE_FALLBACK_LOGGED
++                and _env_truthy("SGLANG_KIMI_WARP_DECODE_MARK_ACTIVE")
++            ):
++                mode = "decode" if is_decode else "non_decode"
++                reason = "; ".join(warp_decode_failures) or "warp-decode guards not evaluated"
++                marker = (
++                    "SGLANG_KIMI_WARP_DECODE_FALLBACK "
++                    f"mode={mode} layer_id={getattr(layer, 'layer_id', 'unknown')} "
++                    f"batch={x.shape[0]} hidden_size={x.shape[-1]} reason={reason}"
++                )
++                logger.warning(marker)
++                _emit_kimi_warp_decode_marker(marker)
++                _KIMI_WARP_DECODE_FALLBACK_LOGGED = True
++            trtllm_mxint4_block_scale_moe(
++                routing_logits=router_logits,  # float
++                routing_bias=correction_bias,
++                hidden_states=x,
++                gemm1_weights=layer.w13_weight_packed,
++                gemm1_weights_scale=layer.w13_weight_scale,
++                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
++                gemm1_beta=None,
++                gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
++                gemm2_weights=layer.w2_weight_packed,
++                gemm2_weights_scale=layer.w2_weight_scale,
++                num_experts=self.moe_runner_config.num_experts,
++                top_k=topk_config.top_k,
++                n_group=topk_config.num_expert_group,
++                topk_group=topk_config.topk_group,
++                intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
++                local_expert_offset=local_expert_offset,
++                local_num_experts=local_num_experts,
++                routed_scaling_factor=routed_scaling_factor,
++                routing_method_type=routing_method_type,
++                tune_max_num_tokens=next_power_of_2(x.shape[0]),
++                output=symm_output,
++            )
+ 
+         return StandardCombineInput(hidden_states=symm_output)
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 5dcc968..3bd3aa6 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -68,6 +68,7 @@ from sglang.srt.model_executor.forward_batch_info import (
+     compute_local_num_token_non_padded,
+     enable_num_token_non_padded,
+ )
++from sglang.srt.compilation.piecewise_context_manager import set_current_forward_batch
+ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+ from sglang.srt.utils import (
+@@ -1138,12 +1139,13 @@ class CudaGraphRunner:
+             ):
+                 kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
+ 
+-            logits_output_or_pp_proxy_tensors = forward(
+-                input_ids,
+-                forward_batch.positions,
+-                forward_batch,
+-                **kwargs,
+-            )
++            with set_current_forward_batch(forward_batch):
++                logits_output_or_pp_proxy_tensors = forward(
++                    input_ids,
++                    forward_batch.positions,
++                    forward_batch,
++                    **kwargs,
++                )
+             return logits_output_or_pp_proxy_tensors
+ 
+         self.deepep_adapter.capture(is_extend_in_batch=False)
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 4cb5034..cc3e93d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -146,6 +146,7 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+     PiecewiseCudaGraphRunner,
+ )
++from sglang.srt.compilation.piecewise_context_manager import set_current_forward_batch
+ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+ from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+@@ -2532,12 +2533,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             if not self.is_generation:
+                 kwargs["get_embedding"] = True
+ 
+-            logits_output_or_pp_proxy_tensors = self.model.forward(
+-                buffers.input_ids,
+-                forward_batch.positions,
+-                forward_batch,
+-                **kwargs,
+-            )
++            with set_current_forward_batch(forward_batch):
++                logits_output_or_pp_proxy_tensors = self.model.forward(
++                    buffers.input_ids,
++                    forward_batch.positions,
++                    forward_batch,
++                    **kwargs,
++                )
+             return logits_output_or_pp_proxy_tensors
+ 
+         torch.get_device_module(self.device).synchronize()
+@@ -2826,12 +2828,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         kwargs = {}
+         if self.support_pp:
+             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+-        return self.model.forward(
+-            forward_batch.input_ids,
+-            forward_batch.positions,
+-            forward_batch,
+-            **kwargs,
+-        )
++        with set_current_forward_batch(forward_batch):
++            return self.model.forward(
++                forward_batch.input_ids,
++                forward_batch.positions,
++                forward_batch,
++                **kwargs,
++            )
+ 
+     def forward_extend(
+         self,
+@@ -2878,15 +2881,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 self.model.prepare_forward_batch(forward_batch)
+             self.attn_backend.init_forward_metadata(forward_batch)
+ 
+-        return (
+-            self.model.forward(
+-                forward_batch.input_ids,
+-                forward_batch.positions,
+-                forward_batch,
+-                **kwargs,
+-            ),
+-            can_run_graph,
+-        )
++        with set_current_forward_batch(forward_batch):
++            return (
++                self.model.forward(
++                    forward_batch.input_ids,
++                    forward_batch.positions,
++                    forward_batch,
++                    **kwargs,
++                ),
++                can_run_graph,
++            )
+ 
+     def forward_idle(
+         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
+@@ -2900,12 +2904,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         kwargs = {}
+         if self.support_pp:
+             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+-        return self.model.forward(
+-            forward_batch.input_ids,
+-            forward_batch.positions,
+-            forward_batch,
+-            **kwargs,
+-        )
++        with set_current_forward_batch(forward_batch):
++            return self.model.forward(
++                forward_batch.input_ids,
++                forward_batch.positions,
++                forward_batch,
++                **kwargs,
++            )
+ 
+     def forward_split_prefill(
+         self,
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 6b23c2c..cb10e3a 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -472,7 +472,7 @@ class DeepseekV2MoE(nn.Module):
+             output_format=(
+                 TopKOutputFormat.STANDARD
+                 if (quant_config is None)
+-                and (not get_moe_runner_backend().is_flashinfer_trtllm())
++                and (not get_moe_runner_backend().is_flashinfer_trtllm_family())
+                 else None
+             ),
+         )
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2f11181..92f8ff6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -174,6 +174,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
+     "triton_kernel",
+     "flashinfer_trtllm",
+     "flashinfer_trtllm_routed",
++    "flashinfer_kimi_warp_decode",
++    "flashinfer_kimi_warp_decode_tiled_down",
+     "flashinfer_cutlass",
+     "flashinfer_mxfp4",
+     "flashinfer_cutedsl",
+@@ -2933,6 +2935,25 @@ class ServerArgs:
+                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
+             )
+ 
++        if self.moe_runner_backend in {
++            "flashinfer_kimi_warp_decode",
++            "flashinfer_kimi_warp_decode_tiled_down",
++        }:
++            assert (
++                is_sm100_supported() or is_sm120_supported()
++            ), "FlashInfer Kimi warp-decode MoE requires Blackwell-class CUDA hardware."
++            assert self.quantization in [
++                "compressed-tensors",
++            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Kimi warp-decode MoE supports only 'compressed-tensors'."
++            assert self.moe_a2a_backend == "none", (
++                "FlashInfer Kimi warp-decode MoE v1 supports only "
++                "moe_a2a_backend='none'."
++            )
++            self.disable_shared_experts_fusion = True
++            logger.warning(
++                "FlashInfer Kimi warp-decode MoE is enabled for decode. Prefill, shared experts, and unsupported decode shapes use the existing paths. --disable-shared-experts-fusion is automatically set."
++            )
++
+         if self.moe_runner_backend == "flashinfer_trtllm_routed":
+             assert self.quantization in [
+                 "fp8",
+@@ -3220,13 +3241,18 @@ class ServerArgs:
+             self.speculative_moe_runner_backend = (
+                 "auto"
+                 if self.moe_runner_backend
+-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
++                in [
++                    "flashinfer_trtllm",
++                    "flashinfer_trtllm_routed",
++                    "flashinfer_kimi_warp_decode",
++                    "flashinfer_kimi_warp_decode_tiled_down",
++                ]
+                 else self.moe_runner_backend
+             )
+         else:
+             assert not MoeRunnerBackend(
+                 self.speculative_moe_runner_backend
+-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
++            ).is_flashinfer_trtllm_family(), "Currently speculative MoE runner backend doesn't support FlashInfer TRTLLM-family MoE, please use triton or auto backend for speculative moe runner instead."
+ 
+         if self.speculative_algorithm == "NEXTN":
+             self.speculative_algorithm = "EAGLE"

@@ -1,0 +1,1888 @@
+diff --git a/csrc/trtllm_fused_moe_kernel_launcher.cu b/csrc/trtllm_fused_moe_kernel_launcher.cu
+index 8f7f157..06bdfc4 100644
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -12,11 +12,13 @@
+  * limitations under the License.
+  */
+ #include <cuda_runtime.h>
++#include <cuda_bf16.h>
+ #include <flashinfer/exception.h>
+ #include <nvrtc.h>
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <iomanip>
+ #include <iostream>
+@@ -48,6 +50,614 @@ enum class Fp8QuantizationType {
+   PerTensorFp8,
+ };
+ 
++namespace kimi_k26_warp_decode {
++
++constexpr int kWarpSize = 32;
++constexpr int kWarpsPerCta = 8;
++constexpr int kThreadsPerCta = kWarpSize * kWarpsPerCta;
++constexpr int kKimiTopK = 8;
++constexpr int kMxInt4GroupSize = 32;
++constexpr int kKimiHiddenSize = 7168;
++// SGLang's Kimi K2.6 InferenceX-style serving path runs TP=8. The MoE
++// intermediate dimension is tensor-parallel sharded, so each rank owns 256
++// intermediate values per expert, then the hidden output is all-reduced.
++constexpr int kKimiK26IntermediateSize = 256;
++constexpr int kKimiNumExperts = 384;
++constexpr int kKimiPackedHiddenSize = kKimiHiddenSize / 2;
++constexpr int kKimiHiddenScaleGroups = kKimiHiddenSize / kMxInt4GroupSize;
++constexpr int kKimiPackedIntermediateSize = kKimiK26IntermediateSize / 2;
++constexpr int kKimiIntermediateScaleGroups = kKimiK26IntermediateSize / kMxInt4GroupSize;
++constexpr int kGateUpWarpsPerToken = kKimiTopK * kKimiK26IntermediateSize;
++constexpr int kGateUpCtasPerToken = kGateUpWarpsPerToken / kWarpsPerCta;
++constexpr int kDownWarpsPerToken = kKimiHiddenSize;
++constexpr int kDownCtasPerToken = kDownWarpsPerToken / kWarpsPerCta;
++constexpr int kDownOutputHiddenTile = 1;
++constexpr int kDownIntermediateTile = 256;
++constexpr int kDownIntermediateTiles = kKimiK26IntermediateSize / kDownIntermediateTile;
++constexpr int kDownExpertTileStrideBytes =
++    kDownOutputHiddenTile * (kDownIntermediateTile / 2);
++constexpr int kDownScaleGroupsPerTile = kDownIntermediateTile / kMxInt4GroupSize;
++static_assert(kKimiHiddenSize % kMxInt4GroupSize == 0,
++              "Kimi K2.6 hidden size must contain whole MxInt4 groups");
++static_assert(kKimiK26IntermediateSize % kMxInt4GroupSize == 0,
++              "Kimi K2.6 intermediate size must contain whole MxInt4 groups");
++static_assert(kGateUpWarpsPerToken % kWarpsPerCta == 0,
++              "gate/up grid must use whole CTAs per token");
++static_assert(kDownWarpsPerToken % kWarpsPerCta == 0,
++              "down grid must use whole CTAs per token");
++static_assert(kDownIntermediateTile % kMxInt4GroupSize == 0,
++              "down intermediate tile must be a multiple of the MxInt4 group size");
++static_assert(kDownExpertTileStrideBytes == 128,
++              "down expert tile payload must begin on 128-byte transaction boundaries");
++static_assert(kDownIntermediateTiles == 1,
++              "Kimi K2.6 TP=8 tiled down decode path expects exactly one K-tile");
++
++__device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, int64_t idx) {
++  return __bfloat162float(ptr[idx]);
++}
++
++__device__ __forceinline__ float routing_logit_load(void const* ptr, bool is_bf16,
++                                                    int64_t idx) {
++  if (is_bf16) {
++    return __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(ptr)[idx]);
++  }
++  return reinterpret_cast<float const*>(ptr)[idx];
++}
++
++__device__ __forceinline__ int8_t unpack_signed_int4(uint8_t packed, int k) {
++  int v = (k & 1) == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
++  return static_cast<int8_t>(v >= 8 ? v - 16 : v);
++}
++
++__device__ __forceinline__ uint8_t load_packed_int4_pair_shared(uint8_t const* ptr,
++                                                               int logical_idx, int lane) {
++  int packed = 0;
++  if ((lane & 1) == 0) {
++    packed = static_cast<int>(ptr[logical_idx >> 1]);
++  }
++  packed = __shfl_sync(0xFFFFFFFFu, packed, lane & ~1);
++  return static_cast<uint8_t>(packed);
++}
++
++__device__ __forceinline__ int8_t load_signed_int4_pair_shared(uint8_t const* ptr,
++                                                              int logical_idx, int lane) {
++  uint8_t packed = load_packed_int4_pair_shared(ptr, logical_idx, lane);
++  return unpack_signed_int4(packed, logical_idx);
++}
++
++__device__ __forceinline__ float warp_sum(float x) {
++#pragma unroll
++  for (int mask = 16; mask > 0; mask >>= 1) {
++    x += __shfl_xor_sync(0xFFFFFFFFu, x, mask);
++  }
++  return x;
++}
++
++__device__ __forceinline__ float warp_broadcast_lane0(float x) {
++  return __shfl_sync(0xFFFFFFFFu, x, 0);
++}
++
++__device__ __forceinline__ int warp_broadcast_lane0(int x) {
++  return __shfl_sync(0xFFFFFFFFu, x, 0);
++}
++
++__device__ __forceinline__ void prefetch_global_l2(void const* ptr) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
++  unsigned long long addr = reinterpret_cast<unsigned long long>(ptr);
++  asm volatile("prefetch.global.L2 [%0];" : : "l"(addr));
++#else
++  (void)ptr;
++#endif
++}
++
++__device__ __forceinline__ float silu(float x) { return x / (1.0f + __expf(-x)); }
++
++struct RoutedTopK8 {
++  int expert0;
++  int expert1;
++  int expert2;
++  int expert3;
++  int expert4;
++  int expert5;
++  int expert6;
++  int expert7;
++  float weight0;
++  float weight1;
++  float weight2;
++  float weight3;
++  float weight4;
++  float weight5;
++  float weight6;
++  float weight7;
++};
++
++__device__ __forceinline__ RoutedTopK8 load_routed_topk8(
++    int32_t const* __restrict__ topk_ids, float const* __restrict__ topk_weights, int token,
++    int local_expert_offset, int lane) {
++  int64_t base = static_cast<int64_t>(token) * kKimiTopK;
++  RoutedTopK8 routes{};
++  if (lane == 0) {
++    routes.expert0 = topk_ids[base + 0] - local_expert_offset;
++    routes.expert1 = topk_ids[base + 1] - local_expert_offset;
++    routes.expert2 = topk_ids[base + 2] - local_expert_offset;
++    routes.expert3 = topk_ids[base + 3] - local_expert_offset;
++    routes.expert4 = topk_ids[base + 4] - local_expert_offset;
++    routes.expert5 = topk_ids[base + 5] - local_expert_offset;
++    routes.expert6 = topk_ids[base + 6] - local_expert_offset;
++    routes.expert7 = topk_ids[base + 7] - local_expert_offset;
++    routes.weight0 = topk_weights[base + 0];
++    routes.weight1 = topk_weights[base + 1];
++    routes.weight2 = topk_weights[base + 2];
++    routes.weight3 = topk_weights[base + 3];
++    routes.weight4 = topk_weights[base + 4];
++    routes.weight5 = topk_weights[base + 5];
++    routes.weight6 = topk_weights[base + 6];
++    routes.weight7 = topk_weights[base + 7];
++  }
++  routes.expert0 = warp_broadcast_lane0(routes.expert0);
++  routes.expert1 = warp_broadcast_lane0(routes.expert1);
++  routes.expert2 = warp_broadcast_lane0(routes.expert2);
++  routes.expert3 = warp_broadcast_lane0(routes.expert3);
++  routes.expert4 = warp_broadcast_lane0(routes.expert4);
++  routes.expert5 = warp_broadcast_lane0(routes.expert5);
++  routes.expert6 = warp_broadcast_lane0(routes.expert6);
++  routes.expert7 = warp_broadcast_lane0(routes.expert7);
++  routes.weight0 = warp_broadcast_lane0(routes.weight0);
++  routes.weight1 = warp_broadcast_lane0(routes.weight1);
++  routes.weight2 = warp_broadcast_lane0(routes.weight2);
++  routes.weight3 = warp_broadcast_lane0(routes.weight3);
++  routes.weight4 = warp_broadcast_lane0(routes.weight4);
++  routes.weight5 = warp_broadcast_lane0(routes.weight5);
++  routes.weight6 = warp_broadcast_lane0(routes.weight6);
++  routes.weight7 = warp_broadcast_lane0(routes.weight7);
++  return routes;
++}
++
++template <int Route>
++__device__ __forceinline__ int routed_expert(RoutedTopK8 const& routes) {
++  if (Route == 0) return routes.expert0;
++  if (Route == 1) return routes.expert1;
++  if (Route == 2) return routes.expert2;
++  if (Route == 3) return routes.expert3;
++  if (Route == 4) return routes.expert4;
++  if (Route == 5) return routes.expert5;
++  if (Route == 6) return routes.expert6;
++  return routes.expert7;
++}
++
++template <int Route>
++__device__ __forceinline__ float routed_weight(RoutedTopK8 const& routes) {
++  if (Route == 0) return routes.weight0;
++  if (Route == 1) return routes.weight1;
++  if (Route == 2) return routes.weight2;
++  if (Route == 3) return routes.weight3;
++  if (Route == 4) return routes.weight4;
++  if (Route == 5) return routes.weight5;
++  if (Route == 6) return routes.weight6;
++  return routes.weight7;
++}
++
++__global__ void kimi_k26_topk_deepseek_v3_kernel(
++    void const* __restrict__ routing_logits, bool routing_logits_is_bf16,
++    __nv_bfloat16 const* __restrict__ routing_bias, int32_t* __restrict__ topk_ids,
++    float* __restrict__ topk_weights, int num_tokens, int num_experts, int top_k,
++    float routed_scaling_factor) {
++  (void)num_experts;
++  (void)top_k;
++  int token = blockIdx.x * blockDim.x + threadIdx.x;
++  if (token >= num_tokens) {
++    return;
++  }
++
++  float best_vals[kKimiTopK];
++  int best_ids[kKimiTopK];
++#pragma unroll
++  for (int i = 0; i < kKimiTopK; ++i) {
++    best_vals[i] = -3.402823466e+38F;
++    best_ids[i] = -1;
++  }
++
++  for (int expert = 0; expert < kKimiNumExperts; ++expert) {
++    float logit =
++        routing_logit_load(routing_logits, routing_logits_is_bf16,
++                           static_cast<int64_t>(token) * kKimiNumExperts + expert);
++    float score = 1.0f / (1.0f + __expf(-logit));
++    float choice = score;
++    if (routing_bias != nullptr) {
++      choice += __bfloat162float(routing_bias[expert]);
++    }
++
++    int insert_at = -1;
++#pragma unroll
++    for (int i = 0; i < kKimiTopK; ++i) {
++      if (choice > best_vals[i]) {
++        insert_at = i;
++        break;
++      }
++    }
++    if (insert_at >= 0) {
++      for (int i = kKimiTopK - 1; i > insert_at; --i) {
++        best_vals[i] = best_vals[i - 1];
++        best_ids[i] = best_ids[i - 1];
++      }
++      best_vals[insert_at] = choice;
++      best_ids[insert_at] = expert;
++    }
++  }
++
++  float weight_sum = 0.0f;
++#pragma unroll
++  for (int i = 0; i < kKimiTopK; ++i) {
++    int expert = best_ids[i];
++    float logit =
++        routing_logit_load(routing_logits, routing_logits_is_bf16,
++                           static_cast<int64_t>(token) * kKimiNumExperts + expert);
++    float score = 1.0f / (1.0f + __expf(-logit));
++    topk_ids[static_cast<int64_t>(token) * kKimiTopK + i] = expert;
++    topk_weights[static_cast<int64_t>(token) * kKimiTopK + i] = score;
++    weight_sum += score;
++  }
++
++  float inv_sum = weight_sum > 0.0f ? routed_scaling_factor / weight_sum : 0.0f;
++#pragma unroll
++  for (int i = 0; i < kKimiTopK; ++i) {
++    topk_weights[static_cast<int64_t>(token) * kKimiTopK + i] *= inv_sum;
++  }
++}
++
++__global__ void kimi_k26_moe_gate_up_warp_decode_kernel(
++    __nv_bfloat16 const* __restrict__ hidden_states, uint8_t const* __restrict__ w13,
++    __nv_bfloat16 const* __restrict__ w13_scale, int32_t const* __restrict__ topk_ids,
++    __nv_bfloat16* __restrict__ intermediate, int num_tokens, int top_k, int hidden_size,
++    int intermediate_size, int local_expert_offset, int local_num_experts) {
++  (void)top_k;
++  (void)hidden_size;
++  (void)intermediate_size;
++  (void)local_num_experts;
++  int lane = threadIdx.x & (kWarpSize - 1);
++  int warp_in_cta = threadIdx.x >> 5;
++  int token = static_cast<int>(blockIdx.y);
++  if (token >= num_tokens) {
++    return;
++  }
++
++  int warp_in_token = static_cast<int>(blockIdx.x) * kWarpsPerCta + warp_in_cta;
++  int route = warp_in_token / kKimiK26IntermediateSize;
++  int neuron = warp_in_token - route * kKimiK26IntermediateSize;
++  int expert = topk_ids[static_cast<int64_t>(token) * kKimiTopK + route] - local_expert_offset;
++  if (expert < 0 || expert >= kKimiNumExperts) {
++    if (lane == 0) {
++      intermediate[(static_cast<int64_t>(token) * kKimiTopK + route) *
++                       kKimiK26IntermediateSize +
++                   neuron] =
++          __float2bfloat16_rn(0.0f);
++    }
++    return;
++  }
++
++  int gate_row = neuron;
++  int up_row = kKimiK26IntermediateSize + neuron;
++  int64_t expert_w13_base = static_cast<int64_t>(expert) * (2 * kKimiK26IntermediateSize) *
++                            kKimiPackedHiddenSize;
++  int64_t expert_scale_base = static_cast<int64_t>(expert) * (2 * kKimiK26IntermediateSize) *
++                              kKimiHiddenScaleGroups;
++  int64_t gate_row_base =
++      expert_w13_base + static_cast<int64_t>(gate_row) * kKimiPackedHiddenSize;
++  int64_t up_row_base = expert_w13_base + static_cast<int64_t>(up_row) * kKimiPackedHiddenSize;
++  int64_t gate_scale_row_base =
++      expert_scale_base + static_cast<int64_t>(gate_row) * kKimiHiddenScaleGroups;
++  int64_t up_scale_row_base =
++      expert_scale_base + static_cast<int64_t>(up_row) * kKimiHiddenScaleGroups;
++  int64_t token_base = static_cast<int64_t>(token) * kKimiHiddenSize;
++  float gate_acc = 0.0f;
++  float up_acc = 0.0f;
++
++  for (int group = 0; group < kKimiHiddenScaleGroups; ++group) {
++    int h = group * kMxInt4GroupSize + lane;
++    float x = bf16_load(hidden_states, token_base + h);
++    int8_t gate_w = load_signed_int4_pair_shared(w13 + gate_row_base, h, lane);
++    int8_t up_w = load_signed_int4_pair_shared(w13 + up_row_base, h, lane);
++    float gate_scale = 0.0f;
++    float up_scale = 0.0f;
++    if (lane == 0) {
++      gate_scale = bf16_load(w13_scale, gate_scale_row_base + group);
++      up_scale = bf16_load(w13_scale, up_scale_row_base + group);
++    }
++    gate_scale = warp_broadcast_lane0(gate_scale);
++    up_scale = warp_broadcast_lane0(up_scale);
++    gate_acc += x * static_cast<float>(gate_w) * gate_scale;
++    up_acc += x * static_cast<float>(up_w) * up_scale;
++  }
++
++  gate_acc = warp_sum(gate_acc);
++  up_acc = warp_sum(up_acc);
++  if (lane == 0) {
++    float y = silu(gate_acc) * up_acc;
++    intermediate[(static_cast<int64_t>(token) * kKimiTopK + route) *
++                     kKimiK26IntermediateSize +
++                 neuron] = __float2bfloat16_rn(y);
++  }
++}
++
++template <int Route>
++__device__ __forceinline__ void accumulate_row_major_down_route(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2,
++    __nv_bfloat16 const* __restrict__ w2_scale, RoutedTopK8 const& routes, int token, int lane,
++    int hidden_dim, float& acc) {
++  int expert = routed_expert<Route>(routes);
++  if (expert < 0 || expert >= kKimiNumExperts) {
++    return;
++  }
++
++  float route_weight = routed_weight<Route>(routes);
++  int64_t expert_w2_base =
++      static_cast<int64_t>(expert) * kKimiHiddenSize * kKimiPackedIntermediateSize;
++  int64_t expert_scale_base =
++      static_cast<int64_t>(expert) * kKimiHiddenSize * kKimiIntermediateScaleGroups;
++  int64_t interm_base =
++      (static_cast<int64_t>(token) * kKimiTopK + Route) * kKimiK26IntermediateSize;
++  int64_t w2_row_base =
++      expert_w2_base + static_cast<int64_t>(hidden_dim) * kKimiPackedIntermediateSize;
++  int64_t scale_row_base = expert_scale_base +
++                           static_cast<int64_t>(hidden_dim) * kKimiIntermediateScaleGroups;
++
++#pragma unroll
++  for (int group = 0; group < kKimiIntermediateScaleGroups; ++group) {
++    int j = group * kMxInt4GroupSize + lane;
++    float x = bf16_load(intermediate, interm_base + j);
++    int8_t w = load_signed_int4_pair_shared(w2 + w2_row_base, j, lane);
++    float scale = 0.0f;
++    if (lane == 0) {
++      scale = bf16_load(w2_scale, scale_row_base + group);
++    }
++    scale = warp_broadcast_lane0(scale);
++    acc += route_weight * x * static_cast<float>(w) * scale;
++  }
++}
++
++__device__ __forceinline__ void accumulate_row_major_down_routes(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2,
++    __nv_bfloat16 const* __restrict__ w2_scale, RoutedTopK8 const& routes, int token, int lane,
++    int hidden_dim, float& acc) {
++  accumulate_row_major_down_route<0>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<1>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<2>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<3>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<4>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<5>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<6>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++  accumulate_row_major_down_route<7>(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                     acc);
++}
++
++__global__ void kimi_k26_moe_down_warp_decode_kernel(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2,
++    __nv_bfloat16 const* __restrict__ w2_scale, int32_t const* __restrict__ topk_ids,
++    float const* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int num_tokens,
++    int top_k, int hidden_size, int intermediate_size, int local_expert_offset,
++    int local_num_experts) {
++  (void)top_k;
++  (void)hidden_size;
++  (void)intermediate_size;
++  (void)local_num_experts;
++  int lane = threadIdx.x & (kWarpSize - 1);
++  int warp_in_cta = threadIdx.x >> 5;
++  int token = static_cast<int>(blockIdx.y);
++  if (token >= num_tokens) {
++    return;
++  }
++
++  int hidden_dim = static_cast<int>(blockIdx.x) * kWarpsPerCta + warp_in_cta;
++  RoutedTopK8 routes =
++      load_routed_topk8(topk_ids, topk_weights, token, local_expert_offset, lane);
++  float acc = 0.0f;
++
++  accumulate_row_major_down_routes(intermediate, w2, w2_scale, routes, token, lane, hidden_dim,
++                                   acc);
++
++  acc = warp_sum(acc);
++  if (lane == 0) {
++    output[static_cast<int64_t>(token) * kKimiHiddenSize + hidden_dim] =
++        __float2bfloat16_rn(acc);
++  }
++}
++
++template <int Route>
++__device__ __forceinline__ void prefetch_tiled_down_route(
++    uint8_t const* __restrict__ w2_tiled, __nv_bfloat16 const* __restrict__ w2_scale_tiled,
++    RoutedTopK8 const& routes, int lane, int64_t tile_group_base, int64_t scale_group_base) {
++  if (lane != 0) {
++    return;
++  }
++  int expert = routed_expert<Route>(routes);
++  if (expert >= 0 && expert < kKimiNumExperts) {
++    prefetch_global_l2(w2_tiled + tile_group_base +
++                       static_cast<int64_t>(expert) * kDownExpertTileStrideBytes);
++    prefetch_global_l2(w2_scale_tiled + scale_group_base +
++                       static_cast<int64_t>(expert) * kDownScaleGroupsPerTile);
++  }
++}
++
++template <int Route>
++__device__ __forceinline__ void accumulate_tiled_down_route(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2_tiled,
++    __nv_bfloat16 const* __restrict__ w2_scale_tiled, RoutedTopK8 const& routes, int token,
++    int lane, int tile_id, int64_t tile_group_base, int64_t scale_group_base, float& acc) {
++  int expert = routed_expert<Route>(routes);
++  if (expert < 0 || expert >= kKimiNumExperts) {
++    return;
++  }
++
++  float route_weight = routed_weight<Route>(routes);
++  int tile_start = tile_id * kDownIntermediateTile;
++  int64_t interm_base =
++      (static_cast<int64_t>(token) * kKimiTopK + Route) * kKimiK26IntermediateSize + tile_start;
++  uint8_t const* tile_ptr =
++      w2_tiled + tile_group_base + static_cast<int64_t>(expert) * kDownExpertTileStrideBytes;
++  int64_t expert_scale_base =
++      scale_group_base + static_cast<int64_t>(expert) * kDownScaleGroupsPerTile;
++
++#pragma unroll
++  for (int group = 0; group < kDownScaleGroupsPerTile; ++group) {
++    int local_j = group * kMxInt4GroupSize + lane;
++    float x = bf16_load(intermediate, interm_base + local_j);
++    int8_t w = load_signed_int4_pair_shared(tile_ptr, local_j, lane);
++    float scale = 0.0f;
++    if (lane == 0) {
++      scale = bf16_load(w2_scale_tiled, expert_scale_base + group);
++    }
++    scale = warp_broadcast_lane0(scale);
++    acc += route_weight * x * static_cast<float>(w) * scale;
++  }
++}
++
++__device__ __forceinline__ int64_t tiled_down_tile_group_base(int output_hidden_tile,
++                                                             int tile_id) {
++  return (static_cast<int64_t>(output_hidden_tile) * kDownIntermediateTiles + tile_id) *
++         kKimiNumExperts * kDownExpertTileStrideBytes;
++}
++
++__device__ __forceinline__ int64_t tiled_down_scale_group_base(int output_hidden_tile,
++                                                              int tile_id) {
++  return (static_cast<int64_t>(output_hidden_tile) * kDownIntermediateTiles + tile_id) *
++         kKimiNumExperts * kDownScaleGroupsPerTile;
++}
++
++__device__ __forceinline__ void prefetch_tiled_down_routes(
++    uint8_t const* __restrict__ w2_tiled, __nv_bfloat16 const* __restrict__ w2_scale_tiled,
++    RoutedTopK8 const& routes, int lane, int64_t tile_group_base, int64_t scale_group_base) {
++  // W_down scales are a sidecar tensor, not inline with the 128B INT4 payload.
++  prefetch_tiled_down_route<0>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<1>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<2>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<3>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<4>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<5>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<6>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++  prefetch_tiled_down_route<7>(w2_tiled, w2_scale_tiled, routes, lane, tile_group_base,
++                               scale_group_base);
++}
++
++__device__ __forceinline__ void accumulate_tiled_down_routes(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2_tiled,
++    __nv_bfloat16 const* __restrict__ w2_scale_tiled, RoutedTopK8 const& routes, int token,
++    int lane, int tile_id, int64_t tile_group_base, int64_t scale_group_base, float& acc) {
++  accumulate_tiled_down_route<0>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<1>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<2>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<3>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<4>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<5>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<6>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  accumulate_tiled_down_route<7>(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++}
++
++__global__ void kimi_k26_moe_down_warp_decode_tiled_kernel(
++    __nv_bfloat16 const* __restrict__ intermediate, uint8_t const* __restrict__ w2_tiled,
++    __nv_bfloat16 const* __restrict__ w2_scale_tiled, int32_t const* __restrict__ topk_ids,
++    float const* __restrict__ topk_weights, __nv_bfloat16* __restrict__ output, int num_tokens,
++    int top_k, int hidden_size, int intermediate_size, int local_expert_offset,
++    int local_num_experts) {
++  (void)top_k;
++  (void)hidden_size;
++  (void)intermediate_size;
++  (void)local_num_experts;
++  int lane = threadIdx.x & (kWarpSize - 1);
++  int warp_in_cta = threadIdx.x >> 5;
++  int token = static_cast<int>(blockIdx.y);
++  if (token >= num_tokens) {
++    return;
++  }
++
++  int hidden_dim = static_cast<int>(blockIdx.x) * kWarpsPerCta + warp_in_cta;
++  int output_hidden_tile = hidden_dim;
++  RoutedTopK8 routes =
++      load_routed_topk8(topk_ids, topk_weights, token, local_expert_offset, lane);
++  float acc = 0.0f;
++
++  prefetch_tiled_down_routes(
++      w2_tiled, w2_scale_tiled, routes, lane,
++      tiled_down_tile_group_base(output_hidden_tile, 0),
++      tiled_down_scale_group_base(output_hidden_tile, 0));
++
++#pragma unroll 1
++  for (int tile_id = 0; tile_id < kDownIntermediateTiles; ++tile_id) {
++    int64_t tile_group_base = tiled_down_tile_group_base(output_hidden_tile, tile_id);
++    int64_t scale_group_base = tiled_down_scale_group_base(output_hidden_tile, tile_id);
++
++    if (tile_id + 1 < kDownIntermediateTiles) {
++      prefetch_tiled_down_routes(
++          w2_tiled, w2_scale_tiled, routes, lane,
++          tiled_down_tile_group_base(output_hidden_tile, tile_id + 1),
++          tiled_down_scale_group_base(output_hidden_tile, tile_id + 1));
++    }
++
++    accumulate_tiled_down_routes(intermediate, w2_tiled, w2_scale_tiled, routes, token, lane,
++                                 tile_id, tile_group_base, scale_group_base, acc);
++  }
++
++  acc = warp_sum(acc);
++  if (lane == 0) {
++    output[static_cast<int64_t>(token) * kKimiHiddenSize + hidden_dim] =
++        __float2bfloat16_rn(acc);
++  }
++}
++
++inline void check_cuda_launch(char const* kernel_name) {
++  cudaError_t err = cudaGetLastError();
++  FLASHINFER_CHECK(err == cudaSuccess, kernel_name, " launch failed: ", cudaGetErrorString(err));
++}
++
++inline bool env_truthy(char const* name) {
++  char const* value = std::getenv(name);
++  if (value == nullptr) {
++    return false;
++  }
++  return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
++         std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "yes") == 0 ||
++         std::strcmp(value, "YES") == 0 || std::strcmp(value, "on") == 0 ||
++         std::strcmp(value, "ON") == 0;
++}
++
++inline void log_cuda_active_marker_once(char const* variant, int num_tokens) {
++  if (!env_truthy("SGLANG_KIMI_WARP_DECODE_MARK_ACTIVE")) {
++    return;
++  }
++  static bool row_major_logged = false;
++  static bool tiled_down_logged = false;
++  bool& logged = std::strcmp(variant, "tiled-W_down") == 0 ? tiled_down_logged : row_major_logged;
++  if (logged) {
++    return;
++  }
++  logged = true;
++  std::cerr << "SGLANG_KIMI_WARP_DECODE_CUDA_ACTIVE variant=" << variant
++            << " num_tokens=" << num_tokens << std::endl;
++}
++
++}  // namespace kimi_k26_warp_decode
++
+ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_type) {
+   switch (quantization_type) {
+     default:
+@@ -2197,6 +2807,564 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
+   return selected_launcher->run(config, enable_pdl);
+ }
+ 
++Array<Tensor> kimi_k26_mxint4_warp_decode_moe(
++    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
++    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
++    Optional<TensorView> gemm1_beta, Optional<TensorView> gemm1_clamp_limit,
++    TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
++    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
++    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
++    int64_t routing_method_type, Optional<TensorView> output) {
++  using namespace kimi_k26_warp_decode;
++
++  int const num_tokens = hidden_states.size(0);
++  int const hidden_size = hidden_states.size(1);
++  int const intermediate = static_cast<int>(intermediate_size);
++  int const local_experts = static_cast<int>(local_num_experts);
++
++  TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
++  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "hidden_states must be bf16.";
++  TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
++      << "routing_logits must be float or bfloat16.";
++  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
++  TVM_FFI_ICHECK_EQ(routing_logits.size(0), num_tokens)
++      << "routing_logits and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts)
++      << "routing_logits dim1 must match num_experts.";
++  if (routing_bias.has_value()) {
++    TVM_FFI_ICHECK_EQ(routing_bias.value().dtype(), dl_bfloat16)
++        << "routing_bias must be bfloat16.";
++    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
++    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
++        << "routing_bias has incorrect shape.";
++  }
++  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_uint8) << "gemm1_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_bfloat16)
++      << "gemm1_weights_scale must be bf16.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
++      << "gemm2_weights_scale must be bf16.";
++
++  TVM_FFI_ICHECK_EQ(top_k, 8) << "kimi_k26_mxint4_warp_decode_moe supports top_k=8 only.";
++  TVM_FFI_ICHECK_EQ(num_experts, 384)
++      << "kimi_k26_mxint4_warp_decode_moe supports num_experts=384 only.";
++  TVM_FFI_ICHECK_EQ(hidden_size, 7168)
++      << "kimi_k26_mxint4_warp_decode_moe supports hidden_size=7168 only.";
++  TVM_FFI_ICHECK_EQ(intermediate, kKimiK26IntermediateSize)
++      << "kimi_k26_mxint4_warp_decode_moe supports intermediate_size="
++      << kKimiK26IntermediateSize << " only.";
++  TVM_FFI_ICHECK_EQ(n_group.value_or(1), 1)
++      << "kimi_k26_mxint4_warp_decode_moe supports n_group=1 only.";
++  TVM_FFI_ICHECK_EQ(topk_group.value_or(1), 1)
++      << "kimi_k26_mxint4_warp_decode_moe supports topk_group=1 only.";
++  TVM_FFI_ICHECK(routing_method_type == static_cast<int64_t>(RoutingMethodType::DeepSeekV3))
++      << "kimi_k26_mxint4_warp_decode_moe supports DeepSeekV3/Kimi biased sigmoid top-k only.";
++  TVM_FFI_ICHECK_EQ(local_expert_offset, 0)
++      << "kimi_k26_mxint4_warp_decode_moe v1 supports local_expert_offset=0 only.";
++  TVM_FFI_ICHECK_EQ(local_num_experts, num_experts)
++      << "kimi_k26_mxint4_warp_decode_moe v1 requires all routed experts to be local.";
++  TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
++                 !gemm1_clamp_limit.has_value())
++      << "kimi_k26_mxint4_warp_decode_moe v1 does not support per-expert SwiGLU "
++         "alpha/beta/clamp tensors.";
++
++  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(2), hidden_size / 2);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), hidden_size / kMxInt4GroupSize);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 3) << "gemm2_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(1), hidden_size);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), intermediate / 2);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), hidden_size);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), intermediate / kMxInt4GroupSize);
++
++  Tensor output_tensor;
++  void* output_ptr = nullptr;
++  if (output.has_value()) {
++    TVM_FFI_ICHECK_EQ(output.value().dtype(), dl_bfloat16) << "output must be bf16.";
++    TVM_FFI_ICHECK_EQ(output.value().ndim(), 2) << "output must be 2D.";
++    TVM_FFI_ICHECK_EQ(output.value().size(0), num_tokens);
++    TVM_FFI_ICHECK_EQ(output.value().size(1), hidden_size);
++    output_ptr = output.value().data_ptr();
++  } else {
++    output_tensor = alloc_tensor({num_tokens, hidden_size}, dl_bfloat16, hidden_states.device());
++    output_ptr = output_tensor.data_ptr();
++  }
++  if (num_tokens == 0) {
++    if (output.has_value()) {
++      return Array<Tensor>();
++    }
++    return {output_tensor};
++  }
++
++  auto topk_ids = alloc_tensor({num_tokens, kKimiTopK}, dl_int32, hidden_states.device());
++  auto topk_weights = alloc_tensor({num_tokens, kKimiTopK}, dl_float32,
++                                   hidden_states.device());
++  auto intermediate_tensor =
++      alloc_tensor({num_tokens, kKimiTopK, kKimiK26IntermediateSize}, dl_bfloat16,
++                   hidden_states.device());
++
++  log_cuda_active_marker_once("row-major", num_tokens);
++
++  cudaStream_t stream = get_stream(hidden_states.device());
++  bool const routing_logits_is_bf16 = routing_logits.dtype() == dl_bfloat16;
++  float const scaling = static_cast<float>(routed_scaling_factor.value_or(1.0));
++  int const topk_threads = 128;
++  int const topk_blocks = (num_tokens + topk_threads - 1) / topk_threads;
++  kimi_k26_topk_deepseek_v3_kernel<<<topk_blocks, topk_threads, 0, stream>>>(
++      routing_logits.data_ptr(), routing_logits_is_bf16,
++      routing_bias.has_value()
++          ? reinterpret_cast<__nv_bfloat16 const*>(routing_bias.value().data_ptr())
++          : nullptr,
++      static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
++      num_tokens, kKimiNumExperts, kKimiTopK, scaling);
++  check_cuda_launch("kimi_k26_topk_deepseek_v3_kernel");
++
++  dim3 gate_up_grid(kGateUpCtasPerToken, num_tokens);
++  kimi_k26_moe_gate_up_warp_decode_kernel<<<gate_up_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(hidden_states.data_ptr()),
++      static_cast<uint8_t const*>(gemm1_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm1_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(intermediate_tensor.data_ptr()), num_tokens,
++      kKimiTopK, kKimiHiddenSize, kKimiK26IntermediateSize,
++      static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_gate_up_warp_decode_kernel");
++
++  dim3 down_grid(kDownCtasPerToken, num_tokens);
++  kimi_k26_moe_down_warp_decode_kernel<<<down_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(intermediate_tensor.data_ptr()),
++      static_cast<uint8_t const*>(gemm2_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm2_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      static_cast<float const*>(topk_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(output_ptr), num_tokens, kKimiTopK, kKimiHiddenSize,
++      kKimiK26IntermediateSize, static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_down_warp_decode_kernel");
++
++  if (output.has_value()) {
++    return Array<Tensor>();
++  }
++  return {output_tensor};
++}
++
++Array<Tensor> kimi_k26_mxint4_warp_decode_tiled_down_moe(
++    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
++    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
++    Optional<TensorView> gemm1_beta, Optional<TensorView> gemm1_clamp_limit,
++    TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
++    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
++    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
++    int64_t routing_method_type, Optional<TensorView> output) {
++  using namespace kimi_k26_warp_decode;
++
++  int const num_tokens = hidden_states.size(0);
++  int const hidden_size = hidden_states.size(1);
++  int const intermediate = static_cast<int>(intermediate_size);
++  int const local_experts = static_cast<int>(local_num_experts);
++  int const num_intermediate_tiles = intermediate / kDownIntermediateTile;
++
++  TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
++  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "hidden_states must be bf16.";
++  TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
++      << "routing_logits must be float or bfloat16.";
++  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
++  TVM_FFI_ICHECK_EQ(routing_logits.size(0), num_tokens)
++      << "routing_logits and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts)
++      << "routing_logits dim1 must match num_experts.";
++  if (routing_bias.has_value()) {
++    TVM_FFI_ICHECK_EQ(routing_bias.value().dtype(), dl_bfloat16)
++        << "routing_bias must be bfloat16.";
++    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
++    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
++        << "routing_bias has incorrect shape.";
++  }
++  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_uint8) << "gemm1_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_bfloat16)
++      << "gemm1_weights_scale must be bf16.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
++      << "gemm2_weights_scale must be bf16.";
++
++  TVM_FFI_ICHECK_EQ(top_k, 8)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports top_k=8 only.";
++  TVM_FFI_ICHECK_EQ(num_experts, 384)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports num_experts=384 only.";
++  TVM_FFI_ICHECK_EQ(hidden_size, 7168)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports hidden_size=7168 only.";
++  TVM_FFI_ICHECK_EQ(intermediate, kKimiK26IntermediateSize)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports intermediate_size="
++      << kKimiK26IntermediateSize << " only.";
++  TVM_FFI_ICHECK_EQ(intermediate % kDownIntermediateTile, 0)
++      << "intermediate_size must be divisible by the decode W_down intermediate tile.";
++  TVM_FFI_ICHECK_EQ(n_group.value_or(1), 1)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports n_group=1 only.";
++  TVM_FFI_ICHECK_EQ(topk_group.value_or(1), 1)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports topk_group=1 only.";
++  TVM_FFI_ICHECK(routing_method_type == static_cast<int64_t>(RoutingMethodType::DeepSeekV3))
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe supports DeepSeekV3/Kimi biased sigmoid "
++         "top-k only.";
++  TVM_FFI_ICHECK_EQ(local_expert_offset, 0)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe v1 supports local_expert_offset=0 only.";
++  TVM_FFI_ICHECK_EQ(local_num_experts, num_experts)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe v1 requires all routed experts to be local.";
++  TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
++                 !gemm1_clamp_limit.has_value())
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe v1 does not support per-expert SwiGLU "
++         "alpha/beta/clamp tensors.";
++
++  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(2), hidden_size / 2);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), hidden_size / kMxInt4GroupSize);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 4)
++      << "gemm2_weights must be tiled [hidden_tile, intermediate_tile, expert, payload].";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), hidden_size / kDownOutputHiddenTile);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(1), num_intermediate_tiles);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(3), kDownExpertTileStrideBytes);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 4)
++      << "gemm2_weights_scale must be tiled [hidden_tile, intermediate_tile, expert, scale].";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), hidden_size / kDownOutputHiddenTile);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), num_intermediate_tiles);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(3), kDownScaleGroupsPerTile);
++
++  Tensor output_tensor;
++  void* output_ptr = nullptr;
++  if (output.has_value()) {
++    TVM_FFI_ICHECK_EQ(output.value().dtype(), dl_bfloat16) << "output must be bf16.";
++    TVM_FFI_ICHECK_EQ(output.value().ndim(), 2) << "output must be 2D.";
++    TVM_FFI_ICHECK_EQ(output.value().size(0), num_tokens);
++    TVM_FFI_ICHECK_EQ(output.value().size(1), hidden_size);
++    output_ptr = output.value().data_ptr();
++  } else {
++    output_tensor = alloc_tensor({num_tokens, hidden_size}, dl_bfloat16, hidden_states.device());
++    output_ptr = output_tensor.data_ptr();
++  }
++  if (num_tokens == 0) {
++    if (output.has_value()) {
++      return Array<Tensor>();
++    }
++    return {output_tensor};
++  }
++
++  auto topk_ids = alloc_tensor({num_tokens, kKimiTopK}, dl_int32, hidden_states.device());
++  auto topk_weights = alloc_tensor({num_tokens, kKimiTopK}, dl_float32,
++                                   hidden_states.device());
++  auto intermediate_tensor =
++      alloc_tensor({num_tokens, kKimiTopK, kKimiK26IntermediateSize}, dl_bfloat16,
++                   hidden_states.device());
++
++  log_cuda_active_marker_once("tiled-W_down", num_tokens);
++
++  cudaStream_t stream = get_stream(hidden_states.device());
++  bool const routing_logits_is_bf16 = routing_logits.dtype() == dl_bfloat16;
++  float const scaling = static_cast<float>(routed_scaling_factor.value_or(1.0));
++  int const topk_threads = 128;
++  int const topk_blocks = (num_tokens + topk_threads - 1) / topk_threads;
++  kimi_k26_topk_deepseek_v3_kernel<<<topk_blocks, topk_threads, 0, stream>>>(
++      routing_logits.data_ptr(), routing_logits_is_bf16,
++      routing_bias.has_value()
++          ? reinterpret_cast<__nv_bfloat16 const*>(routing_bias.value().data_ptr())
++          : nullptr,
++      static_cast<int32_t*>(topk_ids.data_ptr()), static_cast<float*>(topk_weights.data_ptr()),
++      num_tokens, kKimiNumExperts, kKimiTopK, scaling);
++  check_cuda_launch("kimi_k26_topk_deepseek_v3_kernel");
++
++  dim3 gate_up_grid(kGateUpCtasPerToken, num_tokens);
++  kimi_k26_moe_gate_up_warp_decode_kernel<<<gate_up_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(hidden_states.data_ptr()),
++      static_cast<uint8_t const*>(gemm1_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm1_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(intermediate_tensor.data_ptr()), num_tokens,
++      kKimiTopK, kKimiHiddenSize, kKimiK26IntermediateSize,
++      static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_gate_up_warp_decode_kernel");
++
++  dim3 down_grid(kDownCtasPerToken, num_tokens);
++  kimi_k26_moe_down_warp_decode_tiled_kernel<<<down_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(intermediate_tensor.data_ptr()),
++      static_cast<uint8_t const*>(gemm2_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm2_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      static_cast<float const*>(topk_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(output_ptr), num_tokens, kKimiTopK, kKimiHiddenSize,
++      kKimiK26IntermediateSize, static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_down_warp_decode_tiled_kernel");
++
++  if (output.has_value()) {
++    return Array<Tensor>();
++  }
++  return {output_tensor};
++}
++
++Array<Tensor> kimi_k26_mxint4_warp_decode_moe_with_topk(
++    TensorView topk_ids, TensorView topk_weights, TensorView hidden_states,
++    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
++    Optional<TensorView> gemm1_beta, Optional<TensorView> gemm1_clamp_limit,
++    TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
++    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
++    Optional<TensorView> output) {
++  using namespace kimi_k26_warp_decode;
++
++  int const num_tokens = hidden_states.size(0);
++  int const hidden_size = hidden_states.size(1);
++  int const intermediate = static_cast<int>(intermediate_size);
++  int const local_experts = static_cast<int>(local_num_experts);
++
++  TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
++  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "hidden_states must be bf16.";
++  TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
++  TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
++  TVM_FFI_ICHECK_EQ(topk_ids.size(0), num_tokens)
++      << "topk_ids and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
++  TVM_FFI_ICHECK_EQ(topk_weights.ndim(), 2) << "topk_weights must be 2D.";
++  TVM_FFI_ICHECK_EQ(topk_weights.dtype(), dl_float32) << "topk_weights must be float32.";
++  TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_tokens)
++      << "topk_weights and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(topk_weights.size(1), top_k) << "topk_weights dim1 must match top_k.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_uint8) << "gemm1_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_bfloat16)
++      << "gemm1_weights_scale must be bf16.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
++      << "gemm2_weights_scale must be bf16.";
++
++  TVM_FFI_ICHECK_EQ(top_k, 8)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk supports top_k=8 only.";
++  TVM_FFI_ICHECK_EQ(num_experts, 384)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk supports num_experts=384 only.";
++  TVM_FFI_ICHECK_EQ(hidden_size, 7168)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk supports hidden_size=7168 only.";
++  TVM_FFI_ICHECK_EQ(intermediate, kKimiK26IntermediateSize)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk supports intermediate_size="
++      << kKimiK26IntermediateSize << " only.";
++  TVM_FFI_ICHECK_EQ(local_expert_offset, 0)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk v1 supports local_expert_offset=0 only.";
++  TVM_FFI_ICHECK_EQ(local_num_experts, num_experts)
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk v1 requires all routed experts to be local.";
++  TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
++                 !gemm1_clamp_limit.has_value())
++      << "kimi_k26_mxint4_warp_decode_moe_with_topk v1 does not support per-expert SwiGLU "
++         "alpha/beta/clamp tensors.";
++
++  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(2), hidden_size / 2);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), hidden_size / kMxInt4GroupSize);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 3) << "gemm2_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(1), hidden_size);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), intermediate / 2);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), hidden_size);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), intermediate / kMxInt4GroupSize);
++
++  Tensor output_tensor;
++  void* output_ptr = nullptr;
++  if (output.has_value()) {
++    TVM_FFI_ICHECK_EQ(output.value().dtype(), dl_bfloat16) << "output must be bf16.";
++    TVM_FFI_ICHECK_EQ(output.value().ndim(), 2) << "output must be 2D.";
++    TVM_FFI_ICHECK_EQ(output.value().size(0), num_tokens);
++    TVM_FFI_ICHECK_EQ(output.value().size(1), hidden_size);
++    output_ptr = output.value().data_ptr();
++  } else {
++    output_tensor = alloc_tensor({num_tokens, hidden_size}, dl_bfloat16, hidden_states.device());
++    output_ptr = output_tensor.data_ptr();
++  }
++  if (num_tokens == 0) {
++    if (output.has_value()) {
++      return Array<Tensor>();
++    }
++    return {output_tensor};
++  }
++
++  auto intermediate_tensor =
++      alloc_tensor({num_tokens, kKimiTopK, kKimiK26IntermediateSize}, dl_bfloat16,
++                   hidden_states.device());
++
++  log_cuda_active_marker_once("row-major", num_tokens);
++
++  cudaStream_t stream = get_stream(hidden_states.device());
++  dim3 gate_up_grid(kGateUpCtasPerToken, num_tokens);
++  kimi_k26_moe_gate_up_warp_decode_kernel<<<gate_up_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(hidden_states.data_ptr()),
++      static_cast<uint8_t const*>(gemm1_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm1_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(intermediate_tensor.data_ptr()), num_tokens,
++      kKimiTopK, kKimiHiddenSize, kKimiK26IntermediateSize,
++      static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_gate_up_warp_decode_kernel");
++
++  dim3 down_grid(kDownCtasPerToken, num_tokens);
++  kimi_k26_moe_down_warp_decode_kernel<<<down_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(intermediate_tensor.data_ptr()),
++      static_cast<uint8_t const*>(gemm2_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm2_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      static_cast<float const*>(topk_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(output_ptr), num_tokens, kKimiTopK, kKimiHiddenSize,
++      kKimiK26IntermediateSize, static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_down_warp_decode_kernel");
++
++  if (output.has_value()) {
++    return Array<Tensor>();
++  }
++  return {output_tensor};
++}
++
++Array<Tensor> kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk(
++    TensorView topk_ids, TensorView topk_weights, TensorView hidden_states,
++    TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
++    Optional<TensorView> gemm1_beta, Optional<TensorView> gemm1_clamp_limit,
++    TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
++    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
++    Optional<TensorView> output) {
++  using namespace kimi_k26_warp_decode;
++
++  int const num_tokens = hidden_states.size(0);
++  int const hidden_size = hidden_states.size(1);
++  int const intermediate = static_cast<int>(intermediate_size);
++  int const local_experts = static_cast<int>(local_num_experts);
++  int const num_intermediate_tiles = intermediate / kDownIntermediateTile;
++
++  TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
++  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "hidden_states must be bf16.";
++  TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
++  TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
++  TVM_FFI_ICHECK_EQ(topk_ids.size(0), num_tokens)
++      << "topk_ids and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
++  TVM_FFI_ICHECK_EQ(topk_weights.ndim(), 2) << "topk_weights must be 2D.";
++  TVM_FFI_ICHECK_EQ(topk_weights.dtype(), dl_float32) << "topk_weights must be float32.";
++  TVM_FFI_ICHECK_EQ(topk_weights.size(0), num_tokens)
++      << "topk_weights and hidden_states must have the same number of tokens.";
++  TVM_FFI_ICHECK_EQ(topk_weights.size(1), top_k) << "topk_weights dim1 must match top_k.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_uint8) << "gemm1_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be uint8.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_bfloat16)
++      << "gemm1_weights_scale must be bf16.";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_bfloat16)
++      << "gemm2_weights_scale must be bf16.";
++
++  TVM_FFI_ICHECK_EQ(top_k, 8)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk supports top_k=8 only.";
++  TVM_FFI_ICHECK_EQ(num_experts, 384)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk supports num_experts=384 only.";
++  TVM_FFI_ICHECK_EQ(hidden_size, 7168)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk supports hidden_size=7168 only.";
++  TVM_FFI_ICHECK_EQ(intermediate, kKimiK26IntermediateSize)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk supports intermediate_size="
++      << kKimiK26IntermediateSize << " only.";
++  TVM_FFI_ICHECK_EQ(intermediate % kDownIntermediateTile, 0)
++      << "intermediate_size must be divisible by the decode W_down intermediate tile.";
++  TVM_FFI_ICHECK_EQ(local_expert_offset, 0)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk v1 supports "
++         "local_expert_offset=0 only.";
++  TVM_FFI_ICHECK_EQ(local_num_experts, num_experts)
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk v1 requires all routed experts "
++         "to be local.";
++  TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value() &&
++                 !gemm1_clamp_limit.has_value())
++      << "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk v1 does not support per-expert "
++         "SwiGLU alpha/beta/clamp tensors.";
++
++  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D row-major.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights.size(2), hidden_size / 2);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate);
++  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), hidden_size / kMxInt4GroupSize);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 4)
++      << "gemm2_weights must be tiled [hidden_tile, intermediate_tile, expert, payload].";
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), hidden_size / kDownOutputHiddenTile);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(1), num_intermediate_tiles);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights.size(3), kDownExpertTileStrideBytes);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 4)
++      << "gemm2_weights_scale must be tiled [hidden_tile, intermediate_tile, expert, scale].";
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), hidden_size / kDownOutputHiddenTile);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), num_intermediate_tiles);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), local_experts);
++  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(3), kDownScaleGroupsPerTile);
++
++  Tensor output_tensor;
++  void* output_ptr = nullptr;
++  if (output.has_value()) {
++    TVM_FFI_ICHECK_EQ(output.value().dtype(), dl_bfloat16) << "output must be bf16.";
++    TVM_FFI_ICHECK_EQ(output.value().ndim(), 2) << "output must be 2D.";
++    TVM_FFI_ICHECK_EQ(output.value().size(0), num_tokens);
++    TVM_FFI_ICHECK_EQ(output.value().size(1), hidden_size);
++    output_ptr = output.value().data_ptr();
++  } else {
++    output_tensor = alloc_tensor({num_tokens, hidden_size}, dl_bfloat16, hidden_states.device());
++    output_ptr = output_tensor.data_ptr();
++  }
++  if (num_tokens == 0) {
++    if (output.has_value()) {
++      return Array<Tensor>();
++    }
++    return {output_tensor};
++  }
++
++  auto intermediate_tensor =
++      alloc_tensor({num_tokens, kKimiTopK, kKimiK26IntermediateSize}, dl_bfloat16,
++                   hidden_states.device());
++
++  log_cuda_active_marker_once("tiled-W_down", num_tokens);
++
++  cudaStream_t stream = get_stream(hidden_states.device());
++  dim3 gate_up_grid(kGateUpCtasPerToken, num_tokens);
++  kimi_k26_moe_gate_up_warp_decode_kernel<<<gate_up_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(hidden_states.data_ptr()),
++      static_cast<uint8_t const*>(gemm1_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm1_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(intermediate_tensor.data_ptr()), num_tokens,
++      kKimiTopK, kKimiHiddenSize, kKimiK26IntermediateSize,
++      static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_gate_up_warp_decode_kernel");
++
++  dim3 down_grid(kDownCtasPerToken, num_tokens);
++  kimi_k26_moe_down_warp_decode_tiled_kernel<<<down_grid, kThreadsPerCta, 0, stream>>>(
++      reinterpret_cast<__nv_bfloat16 const*>(intermediate_tensor.data_ptr()),
++      static_cast<uint8_t const*>(gemm2_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16 const*>(gemm2_weights_scale.data_ptr()),
++      static_cast<int32_t const*>(topk_ids.data_ptr()),
++      static_cast<float const*>(topk_weights.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(output_ptr), num_tokens, kKimiTopK, kKimiHiddenSize,
++      kKimiK26IntermediateSize, static_cast<int>(local_expert_offset), kKimiNumExperts);
++  check_cuda_launch("kimi_k26_moe_down_warp_decode_tiled_kernel");
++
++  if (output.has_value()) {
++    return Array<Tensor>();
++  }
++  return {output_tensor};
++}
++
+ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
+     int64_t const dtype_act_, int64_t const dtype_weights_, Fp8QuantizationType quantization_type,
+     int64_t const top_k, int64_t const hidden_size, int64_t const intermediate_size,
+@@ -2272,6 +3440,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_moe, trtllm_fp8_per_te
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale_moe);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k26_mxint4_warp_decode_moe,
++                              kimi_k26_mxint4_warp_decode_moe);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k26_mxint4_warp_decode_tiled_down_moe,
++                              kimi_k26_mxint4_warp_decode_tiled_down_moe);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k26_mxint4_warp_decode_moe_with_topk,
++                              kimi_k26_mxint4_warp_decode_moe_with_topk);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk,
++                              kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+ 
+ }  // namespace flashinfer
+diff --git a/flashinfer/fused_moe/__init__.py b/flashinfer/fused_moe/__init__.py
+index e2b4cab..2b9f163 100644
+--- a/flashinfer/fused_moe/__init__.py
++++ b/flashinfer/fused_moe/__init__.py
+@@ -34,6 +34,10 @@ from .core import (
+     trtllm_fp8_per_tensor_scale_moe,
+     trtllm_bf16_moe,
+     trtllm_bf16_routed_moe,
++    kimi_k26_mxint4_warp_decode_moe,
++    kimi_k26_mxint4_warp_decode_tiled_down_moe,
++    kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk,
++    kimi_k26_mxint4_warp_decode_moe_with_topk,
+     trtllm_mxint4_block_scale_moe,
+ )
+ 
+@@ -73,6 +77,10 @@ __all__ = [
+     "trtllm_fp8_block_scale_routed_moe",
+     "trtllm_fp8_per_tensor_scale_moe",
+     "trtllm_mxint4_block_scale_moe",
++    "kimi_k26_mxint4_warp_decode_moe",
++    "kimi_k26_mxint4_warp_decode_tiled_down_moe",
++    "kimi_k26_mxint4_warp_decode_moe_with_topk",
++    "kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk",
+     "fused_topk_deepseek",
+ ]
+ 
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 8bcbe36..7d8507d 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -2132,12 +2132,360 @@ def get_trtllm_moe_sm100_module():
+ 
+         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+ 
++    @register_custom_op(
++        "flashinfer::kimi_k26_mxint4_warp_decode_moe",
++        mutates_args=(""),
++    )
++    def kimi_k26_mxint4_warp_decode_moe_op(
++        routing_logits: torch.Tensor,
++        routing_bias: Optional[torch.Tensor],
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        n_group: Optional[int],
++        topk_group: Optional[int],
++        intermediate_size: int,
++        local_expert_offset: int,
++        num_local_experts: int,
++        routed_scaling_factor: Optional[float],
++        routing_method_type: int,
++        output: Optional[torch.Tensor] = None,
++    ) -> List[torch.Tensor]:
++        num_tokens, hidden_size = hidden_states.shape
++        if output is None:
++            output = torch.empty(
++                num_tokens,
++                hidden_size,
++                dtype=torch.bfloat16,
++                device=hidden_states.device,
++            )
++
++        result = moe_op.kimi_k26_mxint4_warp_decode_moe(
++            routing_logits,
++            routing_bias,
++            hidden_states,
++            gemm1_weights,
++            gemm1_weights_scale,
++            gemm1_alpha,
++            gemm1_beta,
++            gemm1_clamp_limit,
++            gemm2_weights,
++            gemm2_weights_scale,
++            num_experts,
++            top_k,
++            n_group,
++            topk_group,
++            intermediate_size,
++            local_expert_offset,
++            num_local_experts,
++            routed_scaling_factor,
++            routing_method_type,
++            output,
++        )
++        if len(result) > 0:
++            return result
++        return [output]
++
++    @register_fake_op("flashinfer::kimi_k26_mxint4_warp_decode_moe")
++    def _fake_kimi_k26_mxint4_warp_decode_moe(
++        routing_logits: torch.Tensor,
++        routing_bias: Optional[torch.Tensor],
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        n_group: Optional[int],
++        topk_group: Optional[int],
++        intermediate_size: int,
++        local_expert_offset: int,
++        local_num_experts: int,
++        routed_scaling_factor: Optional[float],
++        routing_method_type: int,
++        output: Optional[torch.Tensor],
++    ):
++        if output is not None:
++            return [output]
++        seq_len = hidden_states.shape[0]
++        hidden_size = hidden_states.shape[1]
++        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
++
++    @register_custom_op(
++        "flashinfer::kimi_k26_mxint4_warp_decode_tiled_down_moe",
++        mutates_args=(""),
++    )
++    def kimi_k26_mxint4_warp_decode_tiled_down_moe_op(
++        routing_logits: torch.Tensor,
++        routing_bias: Optional[torch.Tensor],
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        n_group: Optional[int],
++        topk_group: Optional[int],
++        intermediate_size: int,
++        local_expert_offset: int,
++        num_local_experts: int,
++        routed_scaling_factor: Optional[float],
++        routing_method_type: int,
++        output: Optional[torch.Tensor] = None,
++    ) -> List[torch.Tensor]:
++        num_tokens, hidden_size = hidden_states.shape
++        if output is None:
++            output = torch.empty(
++                num_tokens,
++                hidden_size,
++                dtype=torch.bfloat16,
++                device=hidden_states.device,
++            )
++
++        result = moe_op.kimi_k26_mxint4_warp_decode_tiled_down_moe(
++            routing_logits,
++            routing_bias,
++            hidden_states,
++            gemm1_weights,
++            gemm1_weights_scale,
++            gemm1_alpha,
++            gemm1_beta,
++            gemm1_clamp_limit,
++            gemm2_weights,
++            gemm2_weights_scale,
++            num_experts,
++            top_k,
++            n_group,
++            topk_group,
++            intermediate_size,
++            local_expert_offset,
++            num_local_experts,
++            routed_scaling_factor,
++            routing_method_type,
++            output,
++        )
++        if len(result) > 0:
++            return result
++        return [output]
++
++    @register_fake_op("flashinfer::kimi_k26_mxint4_warp_decode_tiled_down_moe")
++    def _fake_kimi_k26_mxint4_warp_decode_tiled_down_moe(
++        routing_logits: torch.Tensor,
++        routing_bias: Optional[torch.Tensor],
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        n_group: Optional[int],
++        topk_group: Optional[int],
++        intermediate_size: int,
++        local_expert_offset: int,
++        local_num_experts: int,
++        routed_scaling_factor: Optional[float],
++        routing_method_type: int,
++        output: Optional[torch.Tensor],
++    ):
++        if output is not None:
++            return [output]
++        seq_len = hidden_states.shape[0]
++        hidden_size = hidden_states.shape[1]
++        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
++
++    @register_custom_op(
++        "flashinfer::kimi_k26_mxint4_warp_decode_moe_with_topk",
++        mutates_args=(""),
++    )
++    def kimi_k26_mxint4_warp_decode_moe_with_topk_op(
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        intermediate_size: int,
++        local_expert_offset: int,
++        num_local_experts: int,
++        output: Optional[torch.Tensor] = None,
++    ) -> List[torch.Tensor]:
++        num_tokens, hidden_size = hidden_states.shape
++        if output is None:
++            output = torch.empty(
++                num_tokens,
++                hidden_size,
++                dtype=torch.bfloat16,
++                device=hidden_states.device,
++            )
++
++        result = moe_op.kimi_k26_mxint4_warp_decode_moe_with_topk(
++            topk_ids,
++            topk_weights,
++            hidden_states,
++            gemm1_weights,
++            gemm1_weights_scale,
++            gemm1_alpha,
++            gemm1_beta,
++            gemm1_clamp_limit,
++            gemm2_weights,
++            gemm2_weights_scale,
++            num_experts,
++            top_k,
++            intermediate_size,
++            local_expert_offset,
++            num_local_experts,
++            output,
++        )
++        if len(result) > 0:
++            return result
++        return [output]
++
++    @register_fake_op("flashinfer::kimi_k26_mxint4_warp_decode_moe_with_topk")
++    def _fake_kimi_k26_mxint4_warp_decode_moe_with_topk(
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        intermediate_size: int,
++        local_expert_offset: int,
++        local_num_experts: int,
++        output: Optional[torch.Tensor],
++    ):
++        if output is not None:
++            return [output]
++        seq_len = hidden_states.shape[0]
++        hidden_size = hidden_states.shape[1]
++        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
++
++    @register_custom_op(
++        "flashinfer::kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk",
++        mutates_args=(""),
++    )
++    def kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk_op(
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        intermediate_size: int,
++        local_expert_offset: int,
++        num_local_experts: int,
++        output: Optional[torch.Tensor] = None,
++    ) -> List[torch.Tensor]:
++        num_tokens, hidden_size = hidden_states.shape
++        if output is None:
++            output = torch.empty(
++                num_tokens,
++                hidden_size,
++                dtype=torch.bfloat16,
++                device=hidden_states.device,
++            )
++
++        result = moe_op.kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk(
++            topk_ids,
++            topk_weights,
++            hidden_states,
++            gemm1_weights,
++            gemm1_weights_scale,
++            gemm1_alpha,
++            gemm1_beta,
++            gemm1_clamp_limit,
++            gemm2_weights,
++            gemm2_weights_scale,
++            num_experts,
++            top_k,
++            intermediate_size,
++            local_expert_offset,
++            num_local_experts,
++            output,
++        )
++        if len(result) > 0:
++            return result
++        return [output]
++
++    @register_fake_op(
++        "flashinfer::kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk"
++    )
++    def _fake_kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk(
++        topk_ids: torch.Tensor,
++        topk_weights: torch.Tensor,
++        hidden_states: torch.Tensor,
++        gemm1_weights: torch.Tensor,
++        gemm1_weights_scale: torch.Tensor,
++        gemm1_alpha: Optional[torch.Tensor],
++        gemm1_beta: Optional[torch.Tensor],
++        gemm1_clamp_limit: Optional[torch.Tensor],
++        gemm2_weights: torch.Tensor,
++        gemm2_weights_scale: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++        intermediate_size: int,
++        local_expert_offset: int,
++        local_num_experts: int,
++        output: Optional[torch.Tensor],
++    ):
++        if output is not None:
++            return [output]
++        seq_len = hidden_states.shape[0]
++        hidden_size = hidden_states.shape[1]
++        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
++
+     return SimpleNamespace(
+         trtllm_bf16_moe=trtllm_bf16_moe_op,
+         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
+         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
+         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+         trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
++        kimi_k26_mxint4_warp_decode_moe=kimi_k26_mxint4_warp_decode_moe_op,
++        kimi_k26_mxint4_warp_decode_tiled_down_moe=(
++            kimi_k26_mxint4_warp_decode_tiled_down_moe_op
++        ),
++        kimi_k26_mxint4_warp_decode_moe_with_topk=(
++            kimi_k26_mxint4_warp_decode_moe_with_topk_op
++        ),
++        kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk=(
++            kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk_op
++        ),
+     )
+ 
+ 
+@@ -3012,3 +3360,209 @@ def trtllm_mxint4_block_scale_moe(
+         output,
+         tune_max_num_tokens,
+     )
++
++
++@flashinfer_api
++def kimi_k26_mxint4_warp_decode_moe(
++    routing_logits: torch.Tensor,
++    routing_bias: Optional[torch.Tensor],
++    hidden_states: torch.Tensor,
++    gemm1_weights: torch.Tensor,
++    gemm1_weights_scale: torch.Tensor,
++    gemm1_alpha: Optional[torch.Tensor],
++    gemm1_beta: Optional[torch.Tensor],
++    gemm1_clamp_limit: Optional[torch.Tensor],
++    gemm2_weights: torch.Tensor,
++    gemm2_weights_scale: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++    n_group: Optional[int],
++    topk_group: Optional[int],
++    intermediate_size: int,
++    local_expert_offset: int,
++    local_num_experts: int,
++    routed_scaling_factor: Optional[float],
++    routing_method_type: int = 2,
++    output: Optional[torch.Tensor] = None,
++) -> List[torch.Tensor]:
++    """Kimi K2.6 decode-only output-centric MxInt4 MoE.
++
++    This v1 API is intentionally shape-restricted to Kimi K2.6 decode:
++    BF16 activations, row-major signed packed MxInt4 weights, BF16 scales
++    with group size 32, hidden size 7168, intermediate size 2048, 384
++    experts, and top-k 8. ``gemm1_weights`` must be in logical
++    ``[gate, up]`` row order with shape ``[experts, 4096, 3584]``.
++    ``gemm2_weights`` must be row-major with shape ``[experts, 7168, 1024]``.
++
++    The operation computes Kimi/DeepSeekV3 biased sigmoid top-k internally,
++    then launches one warp-decode gate/up kernel and one warp-decode down
++    kernel. Prefill and unsupported layouts should continue to use
++    ``trtllm_mxint4_block_scale_moe``.
++    """
++    return get_trtllm_moe_sm100_module().kimi_k26_mxint4_warp_decode_moe(
++        routing_logits,
++        routing_bias,
++        hidden_states,
++        gemm1_weights,
++        gemm1_weights_scale,
++        gemm1_alpha,
++        gemm1_beta,
++        gemm1_clamp_limit,
++        gemm2_weights,
++        gemm2_weights_scale,
++        num_experts,
++        top_k,
++        n_group,
++        topk_group,
++        intermediate_size,
++        local_expert_offset,
++        local_num_experts,
++        routed_scaling_factor,
++        routing_method_type,
++        output,
++    )
++
++
++@flashinfer_api
++def kimi_k26_mxint4_warp_decode_tiled_down_moe(
++    routing_logits: torch.Tensor,
++    routing_bias: Optional[torch.Tensor],
++    hidden_states: torch.Tensor,
++    gemm1_weights: torch.Tensor,
++    gemm1_weights_scale: torch.Tensor,
++    gemm1_alpha: Optional[torch.Tensor],
++    gemm1_beta: Optional[torch.Tensor],
++    gemm1_clamp_limit: Optional[torch.Tensor],
++    gemm2_weights: torch.Tensor,
++    gemm2_weights_scale: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++    n_group: Optional[int],
++    topk_group: Optional[int],
++    intermediate_size: int,
++    local_expert_offset: int,
++    local_num_experts: int,
++    routed_scaling_factor: Optional[float],
++    routing_method_type: int = 2,
++    output: Optional[torch.Tensor] = None,
++) -> List[torch.Tensor]:
++    """Kimi K2.6 decode-only warp decode with tiled W_down and internal top-k."""
++    return get_trtllm_moe_sm100_module().kimi_k26_mxint4_warp_decode_tiled_down_moe(
++        routing_logits,
++        routing_bias,
++        hidden_states,
++        gemm1_weights,
++        gemm1_weights_scale,
++        gemm1_alpha,
++        gemm1_beta,
++        gemm1_clamp_limit,
++        gemm2_weights,
++        gemm2_weights_scale,
++        num_experts,
++        top_k,
++        n_group,
++        topk_group,
++        intermediate_size,
++        local_expert_offset,
++        local_num_experts,
++        routed_scaling_factor,
++        routing_method_type,
++        output,
++    )
++
++
++@flashinfer_api
++def kimi_k26_mxint4_warp_decode_moe_with_topk(
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    hidden_states: torch.Tensor,
++    gemm1_weights: torch.Tensor,
++    gemm1_weights_scale: torch.Tensor,
++    gemm1_alpha: Optional[torch.Tensor],
++    gemm1_beta: Optional[torch.Tensor],
++    gemm1_clamp_limit: Optional[torch.Tensor],
++    gemm2_weights: torch.Tensor,
++    gemm2_weights_scale: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++    intermediate_size: int,
++    local_expert_offset: int,
++    local_num_experts: int,
++    output: Optional[torch.Tensor] = None,
++) -> List[torch.Tensor]:
++    """Two-kernel Kimi K2.6 MxInt4 warp-decode MoE compute path.
++
++    This is the Cursor-style compute API: top-k routing has already been
++    resolved, so the operation launches only gate/up warp decode and down warp
++    decode. Each CTA has eight warps, and each warp owns exactly one output
++    scalar/neuron for its kernel assignment.
++    """
++    return get_trtllm_moe_sm100_module().kimi_k26_mxint4_warp_decode_moe_with_topk(
++        topk_ids,
++        topk_weights,
++        hidden_states,
++        gemm1_weights,
++        gemm1_weights_scale,
++        gemm1_alpha,
++        gemm1_beta,
++        gemm1_clamp_limit,
++        gemm2_weights,
++        gemm2_weights_scale,
++        num_experts,
++        top_k,
++        intermediate_size,
++        local_expert_offset,
++        local_num_experts,
++        output,
++    )
++
++
++@flashinfer_api
++def kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk(
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    hidden_states: torch.Tensor,
++    gemm1_weights: torch.Tensor,
++    gemm1_weights_scale: torch.Tensor,
++    gemm1_alpha: Optional[torch.Tensor],
++    gemm1_beta: Optional[torch.Tensor],
++    gemm1_clamp_limit: Optional[torch.Tensor],
++    gemm2_weights: torch.Tensor,
++    gemm2_weights_scale: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++    intermediate_size: int,
++    local_expert_offset: int,
++    local_num_experts: int,
++    output: Optional[torch.Tensor] = None,
++) -> List[torch.Tensor]:
++    """Kimi K2.6 warp decode with a tiled decode-only W_down layout.
++
++    ``gemm1_weights`` and ``gemm1_weights_scale`` stay in the Cursor-copy
++    row-major expert layout. ``gemm2_weights`` must use
++    ``[hidden_tile, intermediate_tile, expert, packed_tile_payload]`` with
++    output hidden tile 1, intermediate tile 256, and 128 contiguous INT4 bytes
++    per expert tile. ``gemm2_weights_scale`` follows the same tile/expert order
++    with eight BF16 scale groups per tile, matching Kimi's group size 32.
++    """
++    return (
++        get_trtllm_moe_sm100_module()
++        .kimi_k26_mxint4_warp_decode_tiled_down_moe_with_topk(
++            topk_ids,
++            topk_weights,
++            hidden_states,
++            gemm1_weights,
++            gemm1_weights_scale,
++            gemm1_alpha,
++            gemm1_beta,
++            gemm1_clamp_limit,
++            gemm2_weights,
++            gemm2_weights_scale,
++            num_experts,
++            top_k,
++            intermediate_size,
++            local_expert_offset,
++            local_num_experts,
++            output,
++        )
++    )
+diff --git a/flashinfer/jit/env.py b/flashinfer/jit/env.py
+index 3c269b4..bea50ea 100644
+--- a/flashinfer/jit/env.py
++++ b/flashinfer/jit/env.py
+@@ -147,10 +147,29 @@ FLASHINFER_DATA: pathlib.Path = _package_root / "data"
+ FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
+ FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
+ # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
+-CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
+-    _package_root / "data" / "cutlass" / "include",
+-    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
+-]
++
++
++def _get_cutlass_include_dirs() -> list[pathlib.Path]:
++    paths = [
++        _package_root / "data" / "cutlass" / "include",
++        _package_root / "data" / "cutlass" / "tools" / "util" / "include",
++    ]
++
++    env_paths = os.environ.get("FLASHINFER_CUTLASS_INCLUDE_DIR")
++    if env_paths is not None:
++        paths.extend(pathlib.Path(p) for p in env_paths.split(os.pathsep) if p)
++
++    try:
++        import deep_gemm
++
++        paths.append(pathlib.Path(deep_gemm.__path__[0]) / "include")
++    except ImportError:
++        pass
++
++    return paths
++
++
++CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = _get_cutlass_include_dirs()
+ SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
+ 
+ 
+diff --git a/flashinfer/jit/fused_moe.py b/flashinfer/jit/fused_moe.py
+index 78f02b7..d044704 100644
+--- a/flashinfer/jit/fused_moe.py
++++ b/flashinfer/jit/fused_moe.py
+@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ """
+ 
++import os
+ from typing import List
+ 
+ from . import env as jit_env
+@@ -332,9 +333,14 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+         ],
+     )
+ 
+-    # currently only support Blackwell
++    # Production support is Blackwell-only. The Hopper path is an explicit
++    # preflight override for exercising the Kimi warp-decode integration on H100.
++    supported_major_versions = [10, 12]
++    if os.environ.get("SGLANG_KIMI_WARP_DECODE_ALLOW_HOPPER") == "1":
++        supported_major_versions = [9, 10, 12]
++
+     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+-        supported_major_versions=[10, 12]
++        supported_major_versions=supported_major_versions
+     )
+ 
+     return gen_jit_spec(
+diff --git a/version.txt b/version.txt
+index 2228cad..e6c3ce2 100644
+--- a/version.txt
++++ b/version.txt
+@@ -1 +1 @@
+-0.6.7
++0.6.8.post1

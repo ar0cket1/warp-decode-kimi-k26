@@ -1,0 +1,21 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN10flashinfer20kimi_k26_warp_decode42kimi_k26_moe_down_warp_decode_tiled_kernelEPK13__nv_bfloat16PKhS3_PKiPKfPS1_iiiiii' for 'sm_100a'
+ptxas info    : Function properties for _ZN10flashinfer20kimi_k26_warp_decode42kimi_k26_moe_down_warp_decode_tiled_kernelEPK13__nv_bfloat16PKhS3_PKiPKfPS1_iiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 47.765 ms
+ptxas info    : Compiling entry function '_ZN10flashinfer20kimi_k26_warp_decode36kimi_k26_moe_down_warp_decode_kernelEPK13__nv_bfloat16PKhS3_PKiPKfPS1_iiiiii' for 'sm_100a'
+ptxas info    : Function properties for _ZN10flashinfer20kimi_k26_warp_decode36kimi_k26_moe_down_warp_decode_kernelEPK13__nv_bfloat16PKhS3_PKiPKfPS1_iiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 333.278 ms
+ptxas info    : Compiling entry function '_ZN10flashinfer20kimi_k26_warp_decode39kimi_k26_moe_gate_up_warp_decode_kernelEPK13__nv_bfloat16PKhS3_PKiPS1_iiiiii' for 'sm_100a'
+ptxas info    : Function properties for _ZN10flashinfer20kimi_k26_warp_decode39kimi_k26_moe_gate_up_warp_decode_kernelEPK13__nv_bfloat16PKhS3_PKiPS1_iiiiii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 6.989 ms
+ptxas info    : Compiling entry function '_ZN10flashinfer20kimi_k26_warp_decode32kimi_k26_topk_deepseek_v3_kernelEPKvbPK13__nv_bfloat16PiPfiiif' for 'sm_100a'
+ptxas info    : Function properties for _ZN10flashinfer20kimi_k26_warp_decode32kimi_k26_topk_deepseek_v3_kernelEPKvbPK13__nv_bfloat16PiPfiiif
+    64 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers, 64 bytes cumulative stack size
+ptxas info    : Compile time = 20.064 ms
